@@ -1,0 +1,1 @@
+ALTER TABLE users ALTER COLUMN external_id TYPE integer USING external_id::integer;

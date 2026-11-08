@@ -1,0 +1,195 @@
+package dev.rehearsal;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.validation.constraints.*;
+import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
+import org.springframework.web.multipart.MultipartFile;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.*;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.Instant;
+import java.util.*;
+
+@Service
+class WorkspaceStore {
+    record Migration(long id,long projectId,String name,String sql,Instant createdAt) {}
+    record ProbeInput(@NotBlank @Size(max=120) String name,
+                      @NotNull @Pattern(regexp="OLD|NEW") String generation,
+                      @NotBlank @Size(max=8000) String sql) {}
+    record Probe(long id,String name,String generation,String sql) {}
+    record Run(long id,long projectId,long migrationId,String migrationName,String status,int score,
+               Instant createdAt,long durationMs,Map<String,Object> report) {}
+
+    private final JdbcTemplate jdbc;
+    private final ProjectService projects;
+    private final ObjectMapper json;
+    WorkspaceStore(JdbcTemplate jdbc, ProjectService projects, ObjectMapper json) {
+        this.jdbc=jdbc;
+        this.projects=projects;
+        this.json=json;
+    }
+
+    static ResponseStatusException bad(String reason) { return new ResponseStatusException(HttpStatus.BAD_REQUEST,reason); }
+
+    @Transactional
+    Migration upload(long projectId,String email,MultipartFile file) throws IOException {
+        String name=file.getOriginalFilename();
+        if (name == null || !name.matches("[a-zA-Z0-9][a-zA-Z0-9_. -]{0,154}\\.sql") || file.isEmpty()
+                || file.getSize()>256*1024)
+            throw bad("Choose a non-empty .sql file up to 256 KiB with a simple filename");
+        String sql;
+        try { sql=StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(file.getBytes())).toString(); }
+        catch (CharacterCodingException e) { throw bad("SQL files must be UTF-8"); }
+        sql=sql.replaceFirst("^\uFEFF","");
+        if (sql.isBlank() || sql.indexOf(0)>=0) throw bad("The SQL file is empty or contains binary data");
+        return addMigration(projectId,email,name,sql);
+    }
+
+    Migration addMigration(long projectId,String email,String name,String sql) {
+        var project=projects.require(projectId,email);
+        var result=jdbc.queryForObject("insert into migrations(project_id,name,sql_text) values (?,?,?) returning *",
+            this::migrationRow,projectId,name,sql);
+        projects.audit(project.ownerId,"MIGRATION_UPLOADED",result.id());
+        return result;
+    }
+
+    Migration migration(long id,String email) {
+        return jdbc.query("""
+            select m.* from migrations m join projects p on p.id=m.project_id where m.id=? and p.owner_id=?
+            """,this::migrationRow,id,projects.account(email)).stream().findFirst().orElseThrow(ProjectService::missing);
+    }
+
+    List<Migration> migrations(long id,String email) {
+        projects.require(id,email);
+        return jdbc.query("select * from migrations where project_id=? order by id desc",this::migrationRow,id);
+    }
+
+    private Migration migrationRow(ResultSet r,int row) throws SQLException {
+        return new Migration(r.getLong("id"),r.getLong("project_id"),r.getString("name"),
+            r.getString("sql_text"),r.getTimestamp("created_at").toInstant());
+    }
+
+    @Transactional
+    Probe addProbe(long id,String email,ProbeInput input) {
+        var project=projects.require(id,email);
+        jdbc.queryForObject("select id from projects where id=? for update",Long.class,id);
+        if (jdbc.queryForObject("select count(*) from probes where project_id=?",Integer.class,id)>=12)
+            throw bad("A project supports up to 12 compatibility probes");
+        var probe=jdbc.queryForObject("""
+            insert into probes(project_id,name,generation,sql_text) values (?,?,?,?) returning *
+            """,this::probeRow,id,input.name(),input.generation(),input.sql());
+        projects.audit(project.ownerId,"PROBE_ADDED",probe.id());
+        return probe;
+    }
+
+    List<Probe> probes(long id,String email) {
+        projects.require(id,email);
+        return jdbc.query("select * from probes where project_id=? order by id",this::probeRow,id);
+    }
+
+    void deleteProbe(long id,long probe,String email) {
+        projects.require(id,email);
+        if (jdbc.update("delete from probes where id=? and project_id=?",probe,id)==0) throw ProjectService.missing();
+        projects.audit(projects.account(email),"PROBE_DELETED",probe);
+    }
+
+    private Probe probeRow(ResultSet r,int row) throws SQLException {
+        return new Probe(r.getLong("id"),r.getString("name"),r.getString("generation"),r.getString("sql_text"));
+    }
+
+    @Transactional
+    Run createRun(Migration migration,String email) {
+        long account=projects.account(email);
+        jdbc.queryForObject("select id from accounts where id=? for update",Long.class,account);
+        var rows=jdbc.queryForList("select id from projects where id=? and owner_id=? for update",
+            Long.class,migration.projectId(),account);
+        if (rows.isEmpty()) throw ProjectService.missing();
+        if (jdbc.queryForObject("""
+            select count(*) from test_runs r join projects p on p.id=r.project_id
+            where p.owner_id=? and r.status in ('QUEUED','RUNNING')
+            """,Integer.class,account)>=2)
+            throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS,
+                "An account can have up to two active rehearsals.");
+        var run=jdbc.queryForObject("""
+            insert into test_runs(project_id,migration_id,migration_name,status,score,duration_ms,report)
+            values (?,?,?,'QUEUED',0,0,'{}') returning *
+            """,this::runRow,migration.projectId(),migration.id(),migration.name());
+        projects.audit(account,"TEST_QUEUED",run.id());
+        return run;
+    }
+
+    int updateRun(long id,String status,int score,long duration,Map<String,Object> report) {
+        try {
+            return jdbc.update("""
+                update test_runs set status=?,score=?,duration_ms=?,report=?::jsonb
+                where id=? and status in ('QUEUED','RUNNING')
+                """,
+                status,score,duration,json.writeValueAsString(report),id);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new IllegalStateException("Could not serialize report",e);
+        }
+    }
+
+    @Transactional
+    void finishRun(long id,String status,int score,long duration,Map<String,Object> report,long account) {
+        if (updateRun(id,status,score,duration,report)==1) projects.audit(account,"TEST_" + status,id);
+    }
+
+    @Transactional
+    void failInterruptedRun(long id,long account) {
+        if (jdbc.update("""
+            update test_runs set status='FAILED',
+                report=(report - 'activeStep') || jsonb_build_object('error',
+                    'The backend could not complete the rehearsal. Start a new run.')
+            where id=? and status in ('QUEUED','RUNNING')
+            """,id)==1) projects.audit(account,"TEST_INTERRUPTED",id);
+    }
+
+    @Transactional
+    void markInterruptedRuns() {
+        jdbc.update("""
+            with interrupted as (update test_runs set status='FAILED',
+                report=(report - 'activeStep') || jsonb_build_object('error',
+                    'The backend stopped before the rehearsal could finish. Start a new run.')
+            where status in ('QUEUED','RUNNING') returning id,project_id)
+            insert into audit_events(account_id,action,subject_id)
+            select p.owner_id,'TEST_INTERRUPTED',r.id from interrupted r join projects p on p.id=r.project_id
+            """);
+    }
+
+    Run run(long id,String email) {
+        return jdbc.query("""
+            select r.* from test_runs r join projects p on p.id=r.project_id where r.id=? and p.owner_id=?
+            """,this::runRow,id,projects.account(email)).stream().findFirst().orElseThrow(ProjectService::missing);
+    }
+
+    List<Run> runs(Long projectId,String email) {
+        if (projectId != null) {
+            projects.require(projectId,email);
+            return jdbc.query("select * from test_runs where project_id=? order by id desc",this::runRow,projectId);
+        }
+        return jdbc.query("""
+            select r.id,r.project_id,r.migration_id,r.migration_name,r.status,r.score,r.created_at,r.duration_ms,
+                   '{}'::jsonb as report
+            from test_runs r join projects p on p.id=r.project_id where p.owner_id=? order by r.id desc
+            """,this::runRow,projects.account(email));
+    }
+
+    private Run runRow(ResultSet r,int row) throws SQLException {
+        try {
+            Map<String,Object> report=json.readValue(r.getString("report"),new TypeReference<>() {});
+            return new Run(r.getLong("id"),r.getLong("project_id"),r.getLong("migration_id"),
+                r.getString("migration_name"),r.getString("status"),r.getInt("score"),
+                r.getTimestamp("created_at").toInstant(),r.getLong("duration_ms"),report);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new SQLException("Could not read report",e);
+        }
+    }
+}

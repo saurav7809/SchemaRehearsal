@@ -1,0 +1,7 @@
+# Prepend on a dedicated rehearsal cluster before allowing users to submit SQL.
+host sr_metadata sr_app 127.0.0.1/32 scram-sha-256
+host sr_control sr_broker 127.0.0.1/32 scram-sha-256
+host sr_fixture sr_reader 127.0.0.1/32 scram-sha-256
+host /^sr_run_[a-f0-9]{32}$ sr_worker 127.0.0.1/32 scram-sha-256
+host all sr_app,sr_broker,sr_reader,sr_worker 0.0.0.0/0 reject
+host all sr_app,sr_broker,sr_reader,sr_worker ::/0 reject

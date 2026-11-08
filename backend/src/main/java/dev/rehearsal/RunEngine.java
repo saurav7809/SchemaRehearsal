@@ -1,0 +1,269 @@
+package dev.rehearsal;
+
+import jakarta.annotation.PreDestroy;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
+import org.flywaydb.core.api.FlywayException;
+import org.slf4j.*;
+import java.sql.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+@Service
+class RunEngine {
+    private static final Logger log=LoggerFactory.getLogger(RunEngine.class);
+    private static final long CLUSTER_LOCK=787713936294L;
+    private final WorkspaceStore store;
+    private final DatabaseService databases;
+    private final Analyzer analyzer;
+    private final Sandbox sandbox;
+    private final ProjectService projects;
+    private final ExecutionPolicy policy;
+    private final MetadataLease lease;
+    private final Semaphore slots=new Semaphore(5);
+    private final ExecutorService worker=Executors.newSingleThreadExecutor();
+
+    RunEngine(WorkspaceStore store,DatabaseService databases,Analyzer analyzer,Sandbox sandbox,
+              ProjectService projects,ExecutionPolicy policy,MetadataLease lease) {
+        this.store=store;
+        this.databases=databases;
+        this.analyzer=analyzer;
+        this.sandbox=sandbox;
+        this.projects=projects;
+        this.policy=policy;
+        this.lease=lease;
+    }
+
+    WorkspaceStore.Run submit(long id,String email) {
+        policy.requireEnabled();
+        lease.requireActive();
+        if (!slots.tryAcquire())
+            throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS,"Rehearsal queue is full");
+        try {
+            var migration=store.migration(id,email);
+            var input=databases.load(migration.projectId());
+            databases.requireFixture(input);
+            var validation=analyzer.inspect(migration.sql(),false);
+            if (!validation.valid()) throw WorkspaceStore.bad(validation.error());
+            var probes=store.probes(migration.projectId(),email);
+            long account=projects.account(email);
+            var run=store.createRun(migration,email);
+            try {
+                worker.execute(() -> {
+                    try { execute(run.id(),migration,input,probes,validation.findings(),account); }
+                    catch (RuntimeException e) { recordFailure(run.id(),account,e); }
+                    finally { slots.release(); }
+                });
+            } catch (RejectedExecutionException e) {
+                recordFailure(run.id(),account,e);
+                throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,"The rehearsal queue is shutting down");
+            }
+            return run;
+        } catch (RuntimeException e) {
+            slots.release();
+            throw e;
+        }
+    }
+
+    private void execute(long id,WorkspaceStore.Migration migration,DatabaseService.Input input,
+                         List<WorkspaceStore.Probe> probes,List<Risk.Finding> warnings,long account) {
+        var progress=new Progress(id,warnings);
+        String database=sandbox.name();
+        String status="FAILED";
+        try (var broker=sandbox.broker()) {
+            lease.requireActive();
+            policy.verify(broker);
+            lockAndRecover(broker);
+            try {
+                try (var baseline=databases.connect(input)) {
+                    policy.verifyFixture(baseline);
+                    progress.data.put("registeredSchema",Schema.capture(baseline));
+                }
+                progress.advance("Temporary database");
+                sandbox.provision(broker,database);
+                Map<String,String> before;
+                List<Schema.UncoveredForeignKey> uncoveredBefore;
+                Map<Long,Compatibility.Result> baselineResults=new HashMap<>();
+                try (var c=readOnlyWorker(database)) {
+                    before=Schema.capture(c);
+                    uncoveredBefore=Schema.uncoveredForeignKeys(c);
+                    for (var probe:probes)
+                        if (probe.generation().equals("OLD"))
+                            baselineResults.put(probe.id(),Compatibility.run(c,probe.sql()));
+                }
+                progress.data.put("before",before);
+                progress.advance("Migration execution");
+                long migrationStart=System.nanoTime();
+                int applied=sandbox.migrate(database,migration);
+                long migrationMs=millis(migrationStart);
+                progress.data.put("migrationDurationMs",migrationMs);
+                progress.data.put("migrationsApplied",applied);
+                if (applied==0) throw new IllegalStateException("Flyway did not apply the uploaded migration. Versioned files must be above version 0.");
+                if (migrationMs>=3000) progress.findings.add(Risk.observed("Slow fixture execution","MEDIUM",
+                    "Flyway took " + migrationMs + " ms including connection and history overhead.",
+                    "Measure execution and lock duration on representative data volumes."));
+                progress.advance("Compatibility testing");
+                try (var c=readOnlyWorker(database)) {
+                    var after=Schema.capture(c);
+                    progress.data.put("after",after);
+                    var changes=Schema.diff(before,after);
+                    progress.data.put("changes",changes);
+                    for (var key:Schema.uncoveredForeignKeys(c)) {
+                        if (!uncoveredBefore.contains(key))
+                            progress.findings.add(new Risk.Finding("OBSERVED","New foreign key lacks a covering B-tree",
+                                "MEDIUM",key.table(),null,null,key.constraint() + ": " + key.definition() +
+                                ". The referencing columns are absent from the leading keys of any valid, unfiltered B-tree index.",
+                                "Measure parent deletes and key updates on representative data. Consider indexing the referencing columns."));
+                    }
+                    for (var change:changes) {
+                        if (change.kind().equals("REMOVED") && change.object().startsWith("table "))
+                            progress.findings.add(Risk.observed("Relation disappeared","HIGH",change.object() + " is absent after migration.",
+                                "Review dependent callers and confirm whether this is a removal or a rename."));
+                    }
+                    List<Compatibility.Comparison> comparisons=new ArrayList<>();
+                    for (var probe:probes) {
+                        var comparison=Compatibility.compare(probe,baselineResults.get(probe.id()),Compatibility.run(c,probe.sql()));
+                        comparisons.add(comparison);
+                        addCompatibilityFinding(progress.findings,comparison);
+                    }
+                    progress.data.put("compatibility",comparisons);
+                }
+                status="SUCCEEDED";
+            } finally {
+                cleanup(broker,database,progress);
+            }
+        } catch (Exception e) {
+            String error=evidence(e);
+            progress.data.put("error",error);
+            progress.findings.add(Risk.observed("Rehearsal step failed","CRITICAL",progress.stage + ": " + error,
+                "Resolve the recorded error, then rehearse again against the baseline fixture."));
+            progress.endStep("FAILED");
+            if (e instanceof RuntimeException && !(e instanceof FlywayException) && !(e instanceof IllegalStateException))
+                log.warn("Rehearsal {} failed in {} ({})",id,progress.stage,e.getClass().getSimpleName());
+        }
+        progress.advance("Risk analysis");
+        var score=Risk.score(progress.findings);
+        progress.data.put("risk",score);
+        progress.advance("Final report");
+        progress.endStep("SUCCEEDED");
+        if (progress.data.containsKey("cleanupError")) status="FAILED";
+        store.finishRun(id,status,score.score(),millis(progress.started),progress.data,account);
+        log.info("Rehearsal {} completed status={} durationMs={}",id,status,millis(progress.started));
+    }
+
+    private void recordFailure(long id,long account,RuntimeException cause) {
+        log.error("Rehearsal {} could not finish ({})",id,cause.getClass().getSimpleName());
+        try {
+            store.failInterruptedRun(id,account);
+        } catch (RuntimeException e) {
+            log.error("Rehearsal {} failure could not be persisted ({})",id,e.getClass().getSimpleName());
+        }
+    }
+
+    private Connection readOnlyWorker(String database) throws SQLException {
+        var connection=sandbox.worker(database);
+        try {
+            connection.setReadOnly(true);
+            connection.setAutoCommit(false);
+            return connection;
+        } catch (SQLException e) {
+            connection.close();
+            throw e;
+        }
+    }
+
+    private void lockAndRecover(Connection broker) throws SQLException {
+        try (var command=broker.createStatement();
+             var result=command.executeQuery("select pg_try_advisory_lock(" + CLUSTER_LOCK + ")")) {
+            if (!result.next() || !result.getBoolean(1)) throw new SQLException("Another backend is rehearsing on this cluster");
+        }
+        List<String> stale=new ArrayList<>();
+        try (var command=broker.createStatement();
+             var rows=command.executeQuery("""
+                select datname from pg_database where datname ~ '^sr_run_[a-f0-9]{32}$'
+                and pg_get_userbyid(datdba)=current_user
+                """)) {
+            while (rows.next()) stale.add(rows.getString(1));
+        }
+        for (String name:stale) sandbox.drop(broker,name);
+    }
+
+    private void cleanup(Connection broker,String database,Progress progress) {
+        try { sandbox.drop(broker,database); }
+        catch (SQLException e) {
+            progress.data.put("cleanupError",Compatibility.error(e));
+            progress.findings.add(Risk.observed("Temporary database cleanup failed","HIGH",
+                Compatibility.error(e),"Restore broker connectivity. The next run retries stale sandbox cleanup."));
+        }
+    }
+
+    private static void addCompatibilityFinding(List<Risk.Finding> findings,Compatibility.Comparison c) {
+        switch (c.status()) {
+            case "REGRESSION", "NEW_QUERY_FAILED" -> findings.add(Risk.observed("Compatibility query failed","HIGH",
+                c.name() + ": " + c.migrated().error(),"Update the migration or stage a compatibility layer, then rerun this query."));
+            case "SHAPE_CHANGED" -> findings.add(Risk.observed("Query result shape changed","HIGH",
+                c.name() + ": " + c.baseline().columns() + " → " + c.migrated().columns(),
+                "Preserve the original result columns and types until existing consumers are upgraded."));
+            case "BASELINE_FAILED" -> findings.add(Risk.observed("Baseline query already fails","LOW",
+                c.name() + ": " + c.baseline().error(),"Correct the baseline fixture or probe before judging migration compatibility."));
+            default -> { }
+        }
+    }
+
+    private static String evidence(Exception e) {
+        for (Throwable cause=e;cause!=null;cause=cause.getCause())
+            if (cause instanceof SQLException sql) return Compatibility.error(sql);
+        if (e instanceof IllegalStateException || e instanceof FlywayException) {
+            String message=e.getMessage();
+            if (message!=null) return message.substring(0,Math.min(message.length(),1800));
+        }
+        return "The " + e.getClass().getSimpleName() + " interrupted the rehearsal.";
+    }
+
+    private static long millis(long start) { return TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-start); }
+
+    private final class Progress {
+        final long id;
+        final long started=System.nanoTime();
+        final Map<String,Object> data=new LinkedHashMap<>();
+        final List<Map<String,Object>> steps=new ArrayList<>();
+        final List<Risk.Finding> findings;
+        String stage="Database snapshot";
+        long stepStarted=System.nanoTime();
+        boolean open=true;
+
+        Progress(long id,List<Risk.Finding> initial) {
+            this.id=id;
+            findings=new ArrayList<>(initial);
+            data.put("steps",steps);
+            data.put("findings",findings);
+        }
+
+        void advance(String next) {
+            endStep("SUCCEEDED");
+            stage=next;
+            stepStarted=System.nanoTime();
+            open=true;
+            data.put("activeStep",next);
+            store.updateRun(id,"RUNNING",0,millis(started),data);
+        }
+
+        void endStep(String status) {
+            if (!open) return;
+            steps.add(Map.of("name",stage,"status",status,"durationMs",millis(stepStarted)));
+            data.remove("activeStep");
+            open=false;
+        }
+    }
+
+    @PreDestroy void stop() {
+        worker.shutdown();
+        try {
+            if (!worker.awaitTermination(15,TimeUnit.SECONDS)) worker.shutdownNow();
+        } catch (InterruptedException e) {
+            worker.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+}

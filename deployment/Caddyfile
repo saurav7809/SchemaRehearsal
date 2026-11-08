@@ -1,0 +1,56 @@
+{
+	admin off
+	auto_https disable_redirects
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 30s
+			idle 1m
+		}
+		max_header_size 32KB
+	}
+}
+
+{$SR_SITE} {
+	tls "{$SR_TLS_CERT}" "{$SR_TLS_KEY}"
+	encode zstd gzip
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+	}
+
+	@api path /api /api/*
+	handle @api {
+		request_body {
+			max_size 300000
+		}
+		header Cache-Control "no-store"
+		reverse_proxy 127.0.0.1:8080 {
+			header_up -Forwarded
+			header_up -X-Real-IP
+		}
+	}
+
+	@management path /actuator /actuator/*
+	handle @management {
+		respond 404
+	}
+
+	handle /assets/* {
+		root * "{$SR_WEB_ROOT}"
+		header Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	handle {
+		root * "{$SR_WEB_ROOT}"
+		header Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+}

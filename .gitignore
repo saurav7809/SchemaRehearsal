@@ -1,0 +1,7 @@
+target/
+node_modules/
+dist/
+.venv/
+.local/
+__pycache__/
+.pytest_cache/
