@@ -5,6 +5,8 @@ import { api, date, errorMessage, useResource, type Finding, type Migration, typ
 import { Badge, Empty, Heading, Notice, RunsTable } from './ui'
 
 const sections = ['Migrations', 'Database', 'Compatibility', 'Test history', 'Settings'] as const
+const maxMigrationFiles = 20
+const maxMigrationBytes = 256 * 1024
 
 export function ProjectPage() {
   const { id } = useParams()
@@ -33,7 +35,11 @@ function Migrations({ id }: { id: string }) {
   const migrations = useResource<Migration[]>('/projects/' + id + '/migrations')
   const navigate = useNavigate()
   const [selected, setSelected] = useState<number>()
-  const migration = migrations.data?.find(m => m.id === selected) ?? migrations.data?.[0]
+  const [previewName, setPreviewName] = useState('')
+  const migration = selected == null ? migrations.data?.[0] : migrations.data?.find(item => item.id === selected)
+  const files = migration?.files?.length ? migration.files
+    : migration?.sql != null ? [{ name: migration.name, sql: migration.sql }] : []
+  const preview = files.find(file => file.name === previewName) ?? files[0]
   const [validation, setValidation] = useState<{ id: number; valid: boolean; error?: string; findings: Finding[] }>()
   const [error, setError] = useState('')
   const [busy, setBusy] = useState('')
@@ -44,8 +50,19 @@ function Migrations({ id }: { id: string }) {
     setError('')
     try {
       if (name === 'upload' && form) {
-        const { data } = await api.post<Migration>('/projects/' + id + '/migrations/upload', new FormData(form))
+        const body = new FormData(form)
+        const uploads = body.getAll('file').filter((part): part is File => part instanceof File && part.name.length > 0)
+        if (!uploads.length || uploads.length > maxMigrationFiles) {
+          setError('Choose between 1 and ' + maxMigrationFiles + ' SQL files.')
+          return
+        }
+        if (uploads.reduce((sum, file) => sum + file.size, 0) > maxMigrationBytes) {
+          setError('The selected SQL files exceed the 256 KiB total upload limit.')
+          return
+        }
+        const { data } = await api.post<Migration>('/projects/' + id + '/migrations/upload', body)
         setSelected(data.id)
+        setPreviewName('')
         migrations.reload()
         form.reset()
       } else if (migration && name === 'validate') {
@@ -59,21 +76,30 @@ function Migrations({ id }: { id: string }) {
     finally { setBusy('') }
   }
   const currentValidation = validation?.id === migration?.id ? validation : undefined
-  return <>{(error || migrations.error) && <Notice error>{error || migrations.error}</Notice>}
+  return <>{error && <Notice error>{error}</Notice>}
     <div className="split"><section className="panel section"><div className="section-heading"><div><p className="eyebrow">MIGRATION FILES</p><h2>SQL workspace</h2></div><Braces size={20} className="muted" /></div>
-      <form className="upload form-stack" onSubmit={e => action('upload', e)}><label>SQL or Flyway file<input type="file" name="file" accept=".sql" required /></label><button className="button secondary" disabled={!!busy}><Upload size={16} /> {busy === 'upload' ? 'Uploading…' : 'Upload migration'}</button></form>
+      <form className="upload form-stack" aria-busy={busy === 'upload'} onSubmit={e => action('upload', e)}>
+        <label>SQL or Flyway files<input type="file" name="file" accept=".sql" aria-describedby="migration-upload-hint" multiple required disabled={busy === 'upload'} /></label>
+        <p className="muted upload-hint" id="migration-upload-hint">Choose one UTF-8 SQL file or up to {maxMigrationFiles} Flyway files, with 256 KiB total per upload. Bundles use names such as <code>V1__create_table.sql</code> and <code>R__refresh_view.sql</code>.</p>
+        <button className="button secondary" disabled={!!busy}><Upload size={16} /> {busy === 'upload' ? 'Uploading…' : 'Upload migration'}</button>
+      </form>
+      {migrations.error && <Notice error><p>{migrations.error}</p><button className="button secondary" disabled={migrations.loading} onClick={migrations.reload}>Retry migrations</button></Notice>}
       {migrations.loading && <Notice>Loading migrations…</Notice>}
-      {!migrations.loading && !migration && <Empty>Upload a UTF-8 SQL file up to 256 KiB.</Empty>}
-      <div className="file-list">{migrations.data?.map(item => <button className={migration?.id === item.id ? 'active' : ''} key={item.id} onClick={() => setSelected(item.id)}><Braces size={16} /><span>{item.name}<small>{date(item.createdAt)}</small></span></button>)}</div>
+      {!migrations.loading && !migrations.error && !migrations.data?.length && <Empty>Upload your first migration to preview its SQL.</Empty>}
+      <div className="file-list">{migrations.data?.map(item => <button aria-pressed={migration?.id === item.id} className={migration?.id === item.id ? 'active' : ''} key={item.id} onClick={() => { setSelected(item.id); setPreviewName('') }}><Braces size={16} /><span>{item.name}<small>{(item.files?.length ?? 1) > 1 ? item.files?.length + ' files · ' : ''}{date(item.createdAt)}</small></span></button>)}</div>
     </section>
     <section className="panel section">{migration ? <><div className="section-heading"><div><p className="eyebrow">SQL PREVIEW</p><h2 className="wrap-anywhere">{migration.name}</h2></div></div>
-      <pre className="code">{migration.sql}</pre>
+      {files.length > 1 && <label>File to preview<select value={preview?.name} onChange={event => setPreviewName(event.target.value)}>
+        {files.map(file => <option key={file.name} value={file.name}>{file.name}</option>)}
+      </select></label>}
+      <pre className="code" aria-label={preview?.name}>{preview?.sql}</pre>
       {currentValidation && <Notice error={!currentValidation.valid}>{currentValidation.valid
-        ? 'SQL parsed and passed the rehearsal policy. Static findings: ' + currentValidation.findings.length
+        ? (files.length > 1 ? 'All ' + files.length + ' files passed the rehearsal policy. Static findings: '
+          : 'SQL parsed and passed the rehearsal policy. Static findings: ') + currentValidation.findings.length
         : currentValidation.error}</Notice>}
-      {currentValidation?.findings.map((f, i) => <div className="line-item" key={i}><Badge value={f.severity} /><span>{f.title}</span></div>)}
+      {currentValidation?.findings.map((f, i) => <div className="line-item" key={i}><Badge value={f.severity} /><span>{f.title}{f.filename && <> · <code>{f.filename}</code></>}</span></div>)}
       <div className="actions"><button className="button secondary" disabled={!!busy} onClick={() => action('validate')}><ShieldCheck size={16} /> {busy === 'validate' ? 'Validating…' : 'Validate SQL'}</button><button className="button primary" disabled={!!busy} onClick={() => action('test')}><Play size={16} /> {busy === 'test' ? 'Queuing…' : 'Run rehearsal'}</button></div>
-    </> : <Empty>Select a migration to preview and rehearse its SQL.</Empty>}</section></div></>
+    </> : migrations.loading ? <Notice>Loading SQL preview…</Notice> : <Empty>Select a migration to preview and rehearse its SQL.</Empty>}</section></div></>
 }
 
 function DatabasePanel({ id }: { id: string }) {

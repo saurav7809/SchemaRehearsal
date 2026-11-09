@@ -34,6 +34,6 @@ class ApiErrors {
 
     @ExceptionHandler(MaxUploadSizeExceededException.class)
     ResponseEntity<?> size() {
-        return ResponseEntity.status(413).body(Map.of("message","SQL files are limited to 256 KiB"));
+        return ResponseEntity.status(413).body(Map.of("message","An upload can contain up to 256 KiB of SQL."));
     }
 }

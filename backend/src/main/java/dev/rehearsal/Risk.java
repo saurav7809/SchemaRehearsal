@@ -1,12 +1,19 @@
 package dev.rehearsal;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import java.util.List;
 
 final class Risk {
     private Risk() {}
 
     record Finding(String source,String title,String severity,String table,String column,String statement,
-                   String evidence,String recommendation) {
+                   String evidence,String recommendation,
+                   @JsonInclude(JsonInclude.Include.NON_NULL) String filename) {
+        Finding(String source,String title,String severity,String table,String column,String statement,
+                String evidence,String recommendation) {
+            this(source,title,severity,table,column,statement,evidence,recommendation,null);
+        }
+
         int points() {
             return switch (severity) {
                 case "CRITICAL" -> 45;

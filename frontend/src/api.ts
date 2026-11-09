@@ -70,15 +70,17 @@ export function useResource<T>(url: string) {
 }
 
 export type Project = { id: number; name: string; description: string; postgresVersion: string; createdAt: string }
-export type Migration = { id: number; projectId: number; name: string; sql: string; createdAt: string }
+type MigrationFile = { name: string; sql: string }
+export type Migration = { id: number; projectId: number; name: string; sql: string | null; createdAt: string; files?: MigrationFile[] }
 export type Probe = { id: number; name: string; generation: 'OLD' | 'NEW'; sql: string }
-export type Finding = { source: string; severity: string; title: string; table?: string; column?: string; statement?: string; evidence: string; recommendation: string }
+export type Finding = { source: string; severity: string; title: string; filename?: string; table?: string; column?: string; statement?: string; evidence: string; recommendation: string }
 export type QueryResult = { success: boolean; columns: string[]; sampledRows: number; error?: string }
 export type Run = {
   id: number; projectId: number; migrationId: number; migrationName: string; status: string; score: number; durationMs: number; createdAt: string
   report: {
     activeStep?: string; error?: string; cleanupError?: string; findings?: Finding[]
     steps?: { name: string; status: string; durationMs: number }[]
+    migrationFiles?: { name: string; status: 'APPLIED' | 'FAILED' | 'PENDING'; durationMs: number | null; error: string | null }[]
     changes?: { object: string; kind: string; before?: string; after?: string }[]
     risk?: { score: number; classification: string; uncapped: number; factors: { source: string; title: string; points: number }[] }
     compatibility?: { id: number; name: string; generation: string; status: string; baseline?: QueryResult; migrated?: QueryResult }[]

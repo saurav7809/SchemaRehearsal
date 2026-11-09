@@ -26,10 +26,20 @@ class ReportPdf {
         for (var step:report.path("steps"))
             lines.add(step.path("name").asText() + " | " + step.path("status").asText() + " | " + step.path("durationMs").asText() + " ms");
         lines.add("");
+        if (report.has("migrationFiles")) {
+            lines.add("FLYWAY FILES");
+            for (var file:report.path("migrationFiles")) {
+                String duration=file.path("durationMs").isNumber() ? " | " + file.path("durationMs").asText() + " ms" : "";
+                lines.add(file.path("name").asText() + " | " + file.path("status").asText() + duration);
+                if (file.path("error").isTextual()) lines.add("Error: " + file.path("error").asText());
+            }
+            lines.add("");
+        }
         lines.add("FINDINGS AND RECOMMENDATIONS");
         if (report.path("findings").isEmpty()) lines.add("No findings were recorded.");
         for (var f:report.path("findings")) {
             lines.add(f.path("severity").asText() + " / " + f.path("source").asText() + " / " + f.path("title").asText());
+            if (f.path("filename").isTextual()) lines.add("File: " + f.path("filename").asText());
             if (!f.path("table").isNull() && f.has("table")) lines.add("Table: " + f.path("table").asText());
             if (!f.path("column").isNull() && f.has("column")) lines.add("Column: " + f.path("column").asText());
             if (!f.path("statement").isNull() && f.has("statement")) lines.add("SQL: " + f.path("statement").asText());

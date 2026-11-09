@@ -1,5 +1,5 @@
 import pytest
-from analyze import inspect
+from analyze import inspect, inspect_bundle
 
 
 @pytest.mark.parametrize(("sql", "title"), [
@@ -47,3 +47,34 @@ def test_query():
 ])
 def test_blocks_database_control_and_dynamic_sql_functions(sql, probe):
     assert not inspect(sql, probe=probe)["valid"]
+
+
+def test_bundle_preserves_file_evidence_and_statement_count():
+    result = inspect_bundle([
+        {"name": "V1__add.sql", "sql": "ALTER TABLE users ADD COLUMN notes text;"},
+        {"name": "V2__drop.sql", "sql": "ALTER TABLE users DROP COLUMN email;"},
+    ])
+    assert result["valid"]
+    assert result["statementCount"] == 2
+    assert [finding["filename"] for finding in result["findings"]] == ["V2__drop.sql"]
+
+
+def test_bundle_rejects_an_invalid_second_file():
+    result = inspect_bundle([
+        {"name": "V1__add.sql", "sql": "ALTER TABLE users ADD COLUMN notes text;"},
+        {"name": "V2__unsafe.sql", "sql": "SET statement_timeout = 0;"},
+    ])
+    assert not result["valid"]
+    assert result["error"].startswith("V2__unsafe.sql:")
+    assert not result["findings"]
+
+
+def test_bundle_enforces_aggregate_statement_limit():
+    statement = "UPDATE users SET display_name = 'x' WHERE id = 1;"
+    files = [
+        {"name": "V1__one.sql", "sql": statement * 50},
+        {"name": "V2__two.sql", "sql": statement * 50},
+    ]
+    assert inspect_bundle(files)["valid"]
+    files[-1]["sql"] += statement
+    assert not inspect_bundle(files)["valid"]

@@ -44,7 +44,7 @@ class RunEngine {
             var migration=store.migration(id,email);
             var input=databases.load(migration.projectId());
             databases.requireFixture(input);
-            var validation=analyzer.inspect(migration.sql(),false);
+            var validation=analyzer.inspect(migration);
             if (!validation.valid()) throw WorkspaceStore.bad(validation.error());
             var probes=store.probes(migration.projectId(),email);
             long account=projects.account(email);
@@ -95,11 +95,14 @@ class RunEngine {
                 progress.data.put("before",before);
                 progress.advance("Migration execution");
                 long migrationStart=System.nanoTime();
-                int applied=sandbox.migrate(database,migration);
+                var execution=sandbox.migrate(database,migration);
                 long migrationMs=millis(migrationStart);
                 progress.data.put("migrationDurationMs",migrationMs);
-                progress.data.put("migrationsApplied",applied);
-                if (applied==0) throw new IllegalStateException("Flyway did not apply the uploaded migration. Versioned files must be above version 0.");
+                progress.data.put("migrationsApplied",execution.applied());
+                progress.data.put("migrationFiles",execution.migrationFiles());
+                if (execution.error()!=null) throw new IllegalStateException(execution.error());
+                if (execution.applied()!=migration.files().size())
+                    throw new IllegalStateException("Flyway did not apply every uploaded migration. Versioned files must be above version 0.");
                 if (migrationMs>=3000) progress.findings.add(Risk.observed("Slow fixture execution","MEDIUM",
                     "Flyway took " + migrationMs + " ms including connection and history overhead.",
                     "Measure execution and lock duration on representative data volumes."));

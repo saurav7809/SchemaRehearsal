@@ -46,7 +46,25 @@ def inspect(sql, probe=False):
             if table.name.lower() == "flyway_schema_history":
                 return rejected("Flyway history is reserved.")
     return {"valid": True, "error": None,
+            "statementCount": len(statements),
             "findings": [] if probe else [issue for s in statements for issue in findings(s)]}
+
+
+def inspect_bundle(files):
+    if not 1 <= len(files) <= 20:
+        return rejected("A rehearsal needs between 1 and 20 SQL files.")
+    issues = []
+    total = 0
+    for file in files:
+        result = inspect(file["sql"])
+        if not result["valid"]:
+            return rejected(f'{file["name"]}: {result["error"]}')
+        total += result["statementCount"]
+        if total > 100:
+            return rejected("A rehearsal can contain at most 100 SQL statements across all files.")
+        for issue in result["findings"]:
+            issues.append({**issue, "filename": file["name"]})
+    return {"valid": True, "error": None, "statementCount": total, "findings": issues}
 
 
 def rejected(message):
@@ -101,4 +119,5 @@ def findings(statement):
 
 if __name__ == "__main__":
     request = json.loads(sys.stdin.buffer.read().decode("utf-8"))
-    sys.stdout.buffer.write(json.dumps(inspect(request["sql"], request.get("probe", False))).encode("utf-8"))
+    result = inspect_bundle(request["files"]) if "files" in request else inspect(request["sql"], request.get("probe", False))
+    sys.stdout.buffer.write(json.dumps(result).encode("utf-8"))

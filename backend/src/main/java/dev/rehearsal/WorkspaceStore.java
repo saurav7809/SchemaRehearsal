@@ -3,6 +3,7 @@ package dev.rehearsal;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.validation.constraints.*;
+import org.flywaydb.core.api.MigrationVersion;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -19,7 +20,8 @@ import java.util.*;
 
 @Service
 class WorkspaceStore {
-    record Migration(long id,long projectId,String name,String sql,Instant createdAt) {}
+    record MigrationFile(String name,String sql) {}
+    record Migration(long id,long projectId,String name,String sql,Instant createdAt,List<MigrationFile> files) {}
     record ProbeInput(@NotBlank @Size(max=120) String name,
                       @NotNull @Pattern(regexp="OLD|NEW") String generation,
                       @NotBlank @Size(max=8000) String sql) {}
@@ -39,23 +41,73 @@ class WorkspaceStore {
     static ResponseStatusException bad(String reason) { return new ResponseStatusException(HttpStatus.BAD_REQUEST,reason); }
 
     @Transactional
-    Migration upload(long projectId,String email,MultipartFile file) throws IOException {
+    Migration upload(long projectId,String email,List<MultipartFile> parts) throws IOException {
+        var project=projects.require(projectId,email);
+        if (parts.isEmpty() || parts.size()>20) throw bad("Upload between 1 and 20 SQL files.");
+        if (parts.stream().mapToLong(MultipartFile::getSize).sum()>256*1024)
+            throw new ResponseStatusException(HttpStatus.PAYLOAD_TOO_LARGE,"Combined SQL size cannot exceed 256 KiB.");
+        List<MigrationFile> files=new ArrayList<>();
+        for (MultipartFile part:parts) files.add(readFile(part));
+        if (files.size()>1) validateBundleNames(files);
+        return insertMigration(project,files);
+    }
+
+    private static MigrationFile readFile(MultipartFile file) throws IOException {
         String name=file.getOriginalFilename();
-        if (name == null || !name.matches("[a-zA-Z0-9][a-zA-Z0-9_. -]{0,154}\\.sql") || file.isEmpty()
-                || file.getSize()>256*1024)
-            throw bad("Choose a non-empty .sql file up to 256 KiB with a simple filename");
+        if (name == null || !name.matches("[a-zA-Z0-9][a-zA-Z0-9_. -]{0,154}\\.sql") || file.isEmpty())
+            throw bad("Each upload must be a non-empty .sql file with a simple filename.");
         String sql;
         try { sql=StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(file.getBytes())).toString(); }
         catch (CharacterCodingException e) { throw bad("SQL files must be UTF-8"); }
         sql=sql.replaceFirst("^\uFEFF","");
         if (sql.isBlank() || sql.indexOf(0)>=0) throw bad("The SQL file is empty or contains binary data");
-        return addMigration(projectId,email,name,sql);
+        return new MigrationFile(name,sql);
     }
 
+    static void validateBundleNames(List<MigrationFile> files) {
+        Set<String> names=new HashSet<>();
+        Set<String> repeatables=new HashSet<>();
+        Set<MigrationVersion> versions=new TreeSet<>();
+        var baseline=MigrationVersion.fromVersion("0");
+        for (var file:files) {
+            String name=file.name();
+            if (!names.add(name.toLowerCase(Locale.ROOT))) throw bad("Duplicate filename: " + name);
+            var version=MigrationNames.version(name);
+            if (version!=null) {
+                if (version.compareTo(baseline)<=0 || version.toString().length()>50)
+                    throw bad("Flyway versions must be above 0 and at most 50 characters: " + name);
+                if (!versions.add(version)) throw bad("Duplicate Flyway version: " + name);
+            } else if (MigrationNames.isRepeatable(name)) {
+                String description=MigrationNames.repeatableDescription(name);
+                if (description.isEmpty()) throw bad("Repeatable migrations require a description: " + name);
+                if (!repeatables.add(description.toLowerCase(Locale.ROOT)))
+                    throw bad("Duplicate Flyway repeatable description: " + name);
+            } else {
+                throw bad("Bundles require Flyway filenames (V1__description.sql or R__description.sql): " + name);
+            }
+        }
+    }
+
+    @Transactional
     Migration addMigration(long projectId,String email,String name,String sql) {
-        var project=projects.require(projectId,email);
-        var result=jdbc.queryForObject("insert into migrations(project_id,name,sql_text) values (?,?,?) returning *",
-            this::migrationRow,projectId,name,sql);
+        return insertMigration(projects.require(projectId,email),List.of(new MigrationFile(name,sql)));
+    }
+
+    private Migration insertMigration(Project project,List<MigrationFile> files) {
+        var first=files.getFirst();
+        boolean bundle=files.size()>1;
+        String suffix=" + " + (files.size()-1) + (files.size()==2 ? " file" : " files");
+        String name=bundle ? first.name().substring(0,Math.min(first.name().length(),160-suffix.length())) + suffix : first.name();
+        String contents=null;
+        if (bundle) {
+            try { contents=json.writeValueAsString(files); }
+            catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+                throw new IllegalStateException("Could not serialize migration bundle",e);
+            }
+        }
+        var result=jdbc.queryForObject("""
+            insert into migrations(project_id,name,sql_text,bundle_files) values (?,?,?,?::jsonb) returning *
+            """,this::migrationRow,project.id,name,bundle ? null : first.sql(),contents);
         projects.audit(project.ownerId,"MIGRATION_UPLOADED",result.id());
         return result;
     }
@@ -72,8 +124,17 @@ class WorkspaceStore {
     }
 
     private Migration migrationRow(ResultSet r,int row) throws SQLException {
-        return new Migration(r.getLong("id"),r.getLong("project_id"),r.getString("name"),
-            r.getString("sql_text"),r.getTimestamp("created_at").toInstant());
+        String name=r.getString("name");
+        String bundle=r.getString("bundle_files");
+        List<MigrationFile> files;
+        try {
+            files=bundle==null ? List.of(new MigrationFile(name,r.getString("sql_text")))
+                : json.readValue(bundle,new TypeReference<>() {});
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new SQLException("Could not read migration bundle",e);
+        }
+        return new Migration(r.getLong("id"),r.getLong("project_id"),name,
+            files.getFirst().sql(),r.getTimestamp("created_at").toInstant(),files);
     }
 
     @Transactional

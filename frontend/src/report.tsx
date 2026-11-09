@@ -82,9 +82,22 @@ function ReportDetail({ id }: { id: string }) {
         {!scoring.factors.length && <div className="line-item">No contributing findings.</div>}
       </> : <Empty>{active ? 'The risk score appears after the risk analysis step.' : 'This run has no recorded risk calculation.'}</Empty>}
     </section></div>
+    {!!report.migrationFiles?.length && <section className="panel section" aria-labelledby="migration-execution-title">
+      <div className="section-heading"><div><p className="eyebrow">FLYWAY EXECUTION ORDER</p><h2 id="migration-execution-title">Migration files</h2></div></div>
+      <div className="table-wrap"><table>
+        <thead><tr><th scope="col">File</th><th scope="col">Status</th><th scope="col">Duration</th></tr></thead>
+        <tbody>{report.migrationFiles.map(file => <tr key={file.name}>
+          <td><code>{file.name}</code>{file.error && <pre className="error-evidence">{file.error}</pre>}</td>
+          <td><Badge value={file.status} /></td>
+          <td>{file.durationMs == null ? '—' : file.durationMs + ' ms'}</td>
+        </tr>)}</tbody>
+      </table></div>
+    </section>}
     <section className="panel section"><div className="section-heading"><div><p className="eyebrow">EVIDENCE & REMEDIATION</p><h2>Risk findings</h2></div><span className="count">{report.findings?.length ?? 0} findings</span></div>
       {report.findings?.length ? <div className="finding-grid">{report.findings.map((finding, i) => <article className="finding" key={i}><div className="actions"><Badge value={finding.severity} /><Badge value={finding.source} /></div>
-        <h3>{finding.title}</h3>{finding.table && <code>{finding.table}{finding.column ? '.' + finding.column : ''}</code>}
+        <h3>{finding.title}</h3>
+        {finding.filename && <p className="muted">Migration file <code>{finding.filename}</code></p>}
+        {finding.table && <code>{finding.table}{finding.column ? '.' + finding.column : ''}</code>}
         <p>{finding.evidence}</p>{finding.statement && <pre className="code">{finding.statement}</pre>}
         <div className="recommendation"><strong>Recommended approach</strong><p>{finding.recommendation}</p></div>
       </article>)}</div> : <Empty>{active ? 'Findings will appear as evidence is recorded.' : 'No risk findings were recorded for this run.'}</Empty>}

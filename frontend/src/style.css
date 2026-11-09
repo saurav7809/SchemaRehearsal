@@ -167,6 +167,7 @@ td small { display: block; color: var(--muted); margin-top: 3px; }
 .tabs button.selected { color: var(--green); border-color: var(--green); }
 .back { justify-self: start; }
 .upload { padding: 11px; border: 1px dashed #bfd3de; border-radius: 8px; margin-bottom: 12px; }
+.upload-hint { font-size: .78rem; line-height: 1.5; }
 .file-list { display: grid; gap: 5px; }
 .file-list button { display: flex; gap: 8px; align-items: center; text-align: left; padding: 9px; border-radius: 7px; border: 1px solid var(--line); font-size: .84rem; overflow-wrap: anywhere; }
 .file-list button svg { flex-shrink: 0; }

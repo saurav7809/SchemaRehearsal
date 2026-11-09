@@ -53,7 +53,7 @@ Open [SchemaRehearsal](http://127.0.0.1:5173). Vite forwards same-origin API req
 
 1. Register, then open **Projects → Load demo**. The demo creates a project with its fixture connection, two old application probes, and five SQL migrations.
 2. Open **Database → Inspect** to see the baseline. Open **Compatibility** to review the saved probes or add a new application SELECT.
-3. Select a migration, validate it, and choose **Run rehearsal**. Each file runs independently against the same initial fixture.
+3. Select a migration, validate it, and choose **Run rehearsal**. Each demo migration starts from the initial fixture.
 4. Review the workflow, SQLSTATE evidence, risk factors, and schema changes. Use **Download PDF** to export the report.
 
 | Migration | Expected result |
@@ -63,6 +63,8 @@ Open [SchemaRehearsal](http://127.0.0.1:5173). Vite forwards same-origin API req
 | `03_not_null.sql` | Fails with SQLSTATE `23502` because an existing display name is NULL. |
 | `04_invalid_cast.sql` | Fails with SQLSTATE `22P02` because an existing identifier contains letters. |
 | `05_drop_orders.sql` | Drops `orders`. Flyway succeeds and the order query regresses. |
+
+To rehearse changes together, select multiple Flyway SQL files in a single upload. For example, pair `V1__add_notes.sql` with `V2__rename_notes.sql`. Each run applies the selected bundle to one fresh clone in Flyway order. Open the report to see which files applied, which file failed, and which files remained pending.
 
 ## Verification
 
@@ -75,7 +77,7 @@ npm.cmd --prefix frontend run build
 .\scripts\smoke.ps1
 ```
 
-The smoke script needs a running backend and a disposable development cluster. It registers test accounts and leaves demo results available for inspection. Use `-BaseUrl http://127.0.0.1:5173` to test through the Vite proxy.
+The smoke script needs a running backend and a disposable development cluster. It registers test accounts and leaves results available for inspection. It checks the original demo, versioned and repeatable migration ordering, a conflict that occurs only when files run together, duplicate Flyway version rejection, and upload size and file count limits. Use `-BaseUrl http://127.0.0.1:5173` to test through the Vite proxy.
 
 - [Windows and PostgreSQL setup](docs/windows.md)
 - [Production deployment and operations](docs/production.md)

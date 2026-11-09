@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit;
 
 @Component
 class Analyzer implements ApplicationRunner {
-    record Result(boolean valid,String error,List<Risk.Finding> findings) {}
+    record Result(boolean valid,String error,List<Risk.Finding> findings,int statementCount) {}
     private final ObjectMapper json;
     private final String python;
     private final Path script;
@@ -40,6 +40,15 @@ class Analyzer implements ApplicationRunner {
     }
 
     Result inspect(String sql,boolean probe) {
+        return inspectRequest(Map.of("sql",sql,"probe",probe));
+    }
+
+    Result inspect(WorkspaceStore.Migration migration) {
+        if (migration.files().size()==1) return inspect(migration.files().getFirst().sql(),false);
+        return inspectRequest(Map.of("files",migration.files()));
+    }
+
+    private Result inspectRequest(Map<String,?> request) {
         if (!workers.tryAcquire())
             throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS,"The SQL analyzer is busy. Try again shortly.");
         Path input=null;
@@ -48,7 +57,7 @@ class Analyzer implements ApplicationRunner {
         try {
             input=Files.createTempFile("rehearsal-analysis-in-",".json");
             output=Files.createTempFile("rehearsal-analysis-out-",".json");
-            Files.write(input,json.writeValueAsBytes(Map.of("sql",sql,"probe",probe)));
+            Files.write(input,json.writeValueAsBytes(request));
             var command=production ? List.of(python,"-I",script.toString()) : List.of(python,script.toString());
             var builder=new ProcessBuilder(command).redirectInput(input.toFile())
                 .redirectError(ProcessBuilder.Redirect.DISCARD).redirectOutput(output.toFile());

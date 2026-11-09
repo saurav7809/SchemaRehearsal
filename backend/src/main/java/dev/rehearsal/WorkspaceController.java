@@ -29,8 +29,8 @@ class WorkspaceController {
     ProjectService.View demo(Principal p) throws IOException { return demo.create(p.getName()); }
 
     @PostMapping("/projects/{id}/migrations/upload") @ResponseStatus(HttpStatus.CREATED)
-    WorkspaceStore.Migration upload(Principal p,@PathVariable long id,@RequestParam MultipartFile file) throws IOException {
-        return store.upload(id,p.getName(),file);
+    WorkspaceStore.Migration upload(Principal p,@PathVariable long id,@RequestParam("file") List<MultipartFile> files) throws IOException {
+        return store.upload(id,p.getName(),files);
     }
 
     @GetMapping("/projects/{id}/migrations")
@@ -41,7 +41,7 @@ class WorkspaceController {
 
     @PostMapping("/migrations/{id}/validate")
     Analyzer.Result validate(Principal p,@PathVariable long id) {
-        return analyzer.inspect(store.migration(id,p.getName()).sql(),false);
+        return analyzer.inspect(store.migration(id,p.getName()));
     }
 
     @PostMapping("/migrations/{id}/test") @ResponseStatus(HttpStatus.ACCEPTED)
