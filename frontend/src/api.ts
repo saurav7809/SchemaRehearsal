@@ -70,6 +70,7 @@ export function useResource<T>(url: string) {
 }
 
 export type Project = { id: number; name: string; description: string; postgresVersion: string; createdAt: string }
+export type ProjectBaseline = { id: number; projectId: number; name: string; createdAt: string; sourceRunId: number }
 type MigrationFile = { name: string; sql: string }
 export type Migration = { id: number; projectId: number; name: string; sql: string | null; createdAt: string; files?: MigrationFile[] }
 export type Probe = { id: number; name: string; generation: 'OLD' | 'NEW'; sql: string }
@@ -79,6 +80,10 @@ export type Run = {
   id: number; projectId: number; migrationId: number; migrationName: string; status: string; score: number; durationMs: number; createdAt: string
   report: {
     activeStep?: string; error?: string; cleanupError?: string; findings?: Finding[]
+    ci?: { repository: string; pullRequest: number; commit: string }
+    baseline?: { id?: number | null; name: string; sourceRunId?: number | null }
+    saveBaselineAs?: string
+    savedBaseline?: ProjectBaseline
     steps?: { name: string; status: string; durationMs: number }[]
     migrationFiles?: { name: string; status: 'APPLIED' | 'FAILED' | 'PENDING'; durationMs: number | null; error: string | null }[]
     changes?: { object: string; kind: string; before?: string; after?: string }[]

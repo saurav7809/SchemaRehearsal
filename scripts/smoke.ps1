@@ -18,8 +18,8 @@ function Assert($Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 
-function Start-Rehearsal([long]$MigrationId) {
-    $queued = Request POST "/migrations/$MigrationId/test"
+function Start-Rehearsal([long]$MigrationId, $Options) {
+    $queued = Request POST "/migrations/$MigrationId/test" $Options
     $run = $queued
     $deadline = (Get-Date).AddSeconds(90)
     while ($run.status -in 'QUEUED','RUNNING' -and (Get-Date) -lt $deadline) {
@@ -29,6 +29,21 @@ function Start-Rehearsal([long]$MigrationId) {
     Assert ($run.status -in 'SUCCEEDED','FAILED') "Run $($run.id) never finished"
     Assert (-not $run.report.cleanupError) "Cleanup failed for run $($run.id)"
     $run
+}
+
+function Assert-RunBaseline($Run, $Baseline) {
+    $recorded = $Run.report.baseline
+    Assert ($recorded.id -eq $Baseline.id -and $recorded.name -ceq $Baseline.name -and
+        $recorded.sourceRunId -eq $Baseline.sourceRunId) "Run $($Run.id) did not identify the exact baseline"
+}
+
+function Assert-RequestRejected([string]$Method, [string]$Path, [int]$Status, $Body) {
+    try {
+        Request $Method $Path $Body | Out-Null
+        throw "Request should have returned HTTP $Status"
+    } catch {
+        if ($_.Exception.Response.StatusCode.value__ -ne $Status) { throw }
+    }
 }
 
 function Assert-RunFiles($Run, [string[]]$Names, [string[]]$States) {
@@ -216,12 +231,73 @@ try {
     Remove-Item -LiteralPath $bundleFixture.FullName
 }
 
+$baselineFixture = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) ('rehearsal-baselines-' + [guid]::NewGuid().ToString('N')))
+try {
+    $versionA = New-SqlFile $baselineFixture.FullName 'V41__baseline_a.sql' 'ALTER TABLE users ADD COLUMN baseline_a text;'
+    $versionB = New-SqlFile $baselineFixture.FullName 'V42__baseline_b.sql' 'ALTER TABLE users ADD COLUMN baseline_b text;'
+    $rename = New-SqlFile $baselineFixture.FullName 'V41__rename_baseline_a.sql' 'ALTER TABLE users RENAME COLUMN baseline_a TO baseline_renamed;'
+    $migrationA = Request POST "$project/migrations/upload" -Form @{ file=$versionA }
+    $migrationB = Request POST "$project/migrations/upload" -Form @{ file=$versionB }
+    $renameMigration = Request POST "$project/migrations/upload" -Form @{ file=$rename }
+
+    Assert-RequestRejected POST "/migrations/$($migrationA.id)/test" 400 @{ saveBaselineAs=' ' }
+    Assert-RequestRejected POST "/migrations/$($migrationA.id)/test" 400 @{ saveBaselineAs=('x' * 81) }
+    $sourceA = Start-Rehearsal $migrationA.id @{ saveBaselineAs='Release A' }
+    Assert ($sourceA.status -eq 'SUCCEEDED') "Could not save Release A: $($sourceA.report.error)"
+    $sourceB = Start-Rehearsal $migrationB.id @{ saveBaselineAs='Release B' }
+    Assert ($sourceB.status -eq 'SUCCEEDED') "Could not save Release B: $($sourceB.report.error)"
+    $baselineA = $sourceA.report.savedBaseline
+    $baselineB = $sourceB.report.savedBaseline
+    Assert ($null -ne $baselineA.id -and $baselineA.sourceRunId -eq $sourceA.id -and $baselineA.name -eq 'Release A') 'Release A was not saved with its source run'
+    Assert ($null -ne $baselineB.id -and $baselineB.sourceRunId -eq $sourceB.id -and $baselineB.name -eq 'Release B') 'Release B was not saved with its source run'
+    Assert ($baselineA.id -ne $baselineB.id) 'Different releases received the same baseline ID'
+    Assert ($sourceA.report.baseline.name -and $null -eq $sourceA.report.baseline.id) 'Shared fixture origin was not recorded'
+    $available = Request GET "$project/baselines"
+    Assert ($available.Count -eq 2 -and $available.id -contains $baselineA.id -and $available.id -contains $baselineB.id) 'Project baselines are missing from the list'
+
+    $passed = Start-Rehearsal $renameMigration.id @{ baselineId=$baselineA.id }
+    Assert ($passed.status -eq 'SUCCEEDED') "Release A rehearsal failed: $($passed.report.error)"
+    Assert-RunBaseline $passed $baselineA
+    Assert ($passed.report.changes.object -contains 'column public.users.baseline_renamed') 'Selected baseline schema change is missing'
+    Assert-Pdf $passed.id
+
+    $rejected = Start-Rehearsal $renameMigration.id @{ baselineId=$baselineB.id; saveBaselineAs='Failed release' }
+    Assert ($rejected.status -eq 'FAILED' -and $rejected.report.error -match '42703') 'The same migration should fail against Release B'
+    Assert-RunBaseline $rejected $baselineB
+    Assert ($rejected.report.before.'column public.users.baseline_b' -eq 'text NULL' -and
+        $null -eq $rejected.report.before.'column public.users.baseline_a') 'Release B schema evidence is wrong'
+    Assert ($null -eq $rejected.report.savedBaseline -and (Request GET "$project/baselines").Count -eq 2) 'A failed rehearsal saved a baseline'
+
+    $rerun = Start-Rehearsal $renameMigration.id @{ baselineId=$baselineA.id }
+    Assert ($rerun.status -eq 'SUCCEEDED') 'Rehearsing a migration modified its saved baseline'
+    Assert-RunBaseline $rerun $baselineA
+    Write-Output 'The same migration passed on Release A and failed on Release B. Release A remained reusable.'
+
+    $other = Request POST '/projects/demo'
+    try {
+        $otherMigration = Request POST "/projects/$($other.id)/migrations/upload" -Form @{ file=$rename }
+        Assert-RequestRejected POST "/migrations/$($otherMigration.id)/test" 404 @{ baselineId=$baselineA.id }
+        Assert-RequestRejected DELETE "/projects/$($other.id)/baselines/$($baselineA.id)" 404
+    } finally {
+        Request DELETE "/projects/$($other.id)"
+    }
+
+    Request DELETE "$project/baselines/$($baselineA.id)"
+    Assert-RequestRejected POST "/migrations/$($renameMigration.id)/test" 404 @{ baselineId=$baselineA.id }
+    $historical = Request GET "/reports/$($passed.id)"
+    Assert-RunBaseline $historical $baselineA
+    Request DELETE "$project/baselines/$($baselineB.id)"
+    Assert ((Request GET "$project/baselines").Count -eq 0) 'Deleted baselines are still listed'
+    $defaultRun = Start-Rehearsal $migrationA.id
+    Assert ($defaultRun.status -eq 'SUCCEEDED' -and $null -eq $defaultRun.report.baseline.id) 'Shared fixture rehearsal failed after baseline deletion'
+    Write-Output 'Cross-project access and deleted baseline selections rejected. Historical baseline identity preserved.'
+} finally {
+    Get-ChildItem -LiteralPath $baselineFixture.FullName -File | ForEach-Object { Remove-Item -LiteralPath $_.FullName }
+    Remove-Item -LiteralPath $baselineFixture.FullName
+}
+
 Request POST '/auth/logout'
 New-Session
-try {
-    Request GET "/reports/$lastReport" | Out-Null
-    throw 'A different account could access the report'
-} catch {
-    if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
-}
+Assert-RequestRejected GET "/reports/$lastReport" 404
+Assert-RequestRejected GET "$project/baselines" 404
 Write-Output 'Smoke checks passed, including PDF downloads and project ownership.'

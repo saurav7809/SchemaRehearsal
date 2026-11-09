@@ -1,9 +1,11 @@
 package dev.rehearsal;
 
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.server.ResponseStatusException;
 import java.io.IOException;
 import java.security.Principal;
 import java.util.*;
@@ -16,13 +18,16 @@ class WorkspaceController {
     private final Analyzer analyzer;
     private final ReportPdf pdf;
     private final DemoService demo;
+    private final BaselineStore baselines;
 
-    WorkspaceController(WorkspaceStore store,RunEngine engine,Analyzer analyzer,ReportPdf pdf,DemoService demo) {
+    WorkspaceController(WorkspaceStore store,RunEngine engine,Analyzer analyzer,ReportPdf pdf,DemoService demo,
+                        BaselineStore baselines) {
         this.store=store;
         this.engine=engine;
         this.analyzer=analyzer;
         this.pdf=pdf;
         this.demo=demo;
+        this.baselines=baselines;
     }
 
     @PostMapping("/projects/demo") @ResponseStatus(HttpStatus.CREATED)
@@ -45,7 +50,27 @@ class WorkspaceController {
     }
 
     @PostMapping("/migrations/{id}/test") @ResponseStatus(HttpStatus.ACCEPTED)
-    WorkspaceStore.Run test(Principal p,@PathVariable long id) { return engine.submit(id,p.getName()); }
+    WorkspaceStore.Run testDefault(Principal p,@PathVariable long id,HttpServletRequest request) throws IOException {
+        if (request.getInputStream().read()!=-1)
+            throw new ResponseStatusException(HttpStatus.UNSUPPORTED_MEDIA_TYPE,"Send rehearsal options as application/json.");
+        return engine.submit(id,p.getName(),null);
+    }
+
+    @PostMapping(value="/migrations/{id}/test",consumes=MediaType.APPLICATION_JSON_VALUE)
+    @ResponseStatus(HttpStatus.ACCEPTED)
+    WorkspaceStore.Run test(Principal p,@PathVariable long id,@Valid @RequestBody RunEngine.Request request) {
+        return engine.submit(id,p.getName(),request);
+    }
+
+    @GetMapping("/projects/{id}/baselines")
+    List<BaselineStore.View> baselines(Principal p,@PathVariable long id) {
+        return baselines.list(id,p.getName());
+    }
+
+    @DeleteMapping("/projects/{id}/baselines/{baselineId}") @ResponseStatus(HttpStatus.NO_CONTENT)
+    void removeBaseline(Principal p,@PathVariable long id,@PathVariable long baselineId) {
+        baselines.delete(id,baselineId,p.getName());
+    }
 
     @GetMapping("/projects/{id}/queries")
     List<WorkspaceStore.Probe> queries(Principal p,@PathVariable long id) { return store.probes(id,p.getName()); }

@@ -19,6 +19,7 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.context.HttpSessionSecurityContextRepository;
 import org.springframework.security.web.csrf.*;
 import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter.ReferrerPolicy;
+import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -54,13 +55,17 @@ class Security {
 
     @Bean SecurityFilterChain chain(HttpSecurity http, HttpSessionSecurityContextRepository securityContexts,
                                     HttpSessionCsrfTokenRepository csrfTokens) throws Exception {
+        var paths=PathPatternRequestMatcher.withDefaults();
+        var ciSubmission=paths.matcher(HttpMethod.POST,"/api/ci/rehearsals");
+        var ciResult=paths.matcher(HttpMethod.GET,"/api/ci/rehearsals/{id}");
         return http.authorizeHttpRequests(auth -> auth
                 .requestMatchers(AuthRateLimitFilter.CSRF, AuthRateLimitFilter.REGISTER, AuthRateLimitFilter.LOGIN).permitAll()
+                .requestMatchers(ciSubmission,ciResult).permitAll()
                 .requestMatchers(HttpMethod.GET, "/actuator/health/liveness", "/actuator/health/readiness").permitAll()
                 .requestMatchers("/actuator/**").denyAll()
                 .anyRequest().authenticated())
             .securityContext(context -> context.securityContextRepository(securityContexts))
-            .csrf(csrf -> csrf.csrfTokenRepository(csrfTokens))
+            .csrf(csrf -> csrf.csrfTokenRepository(csrfTokens).ignoringRequestMatchers(ciSubmission))
             .requestCache(AbstractHttpConfigurer::disable)
             .headers(headers -> headers.frameOptions(frame -> frame.deny())
                 .referrerPolicy(referrer -> referrer.policy(ReferrerPolicy.NO_REFERRER)))

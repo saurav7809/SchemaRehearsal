@@ -20,6 +20,13 @@ class ReportPdf {
             "Run #" + run.id() + " | " + run.migrationName(),
             run.createdAt() + " | " + run.status() + " | " + run.durationMs() + " ms",
             "Risk: " + run.score() + "/100 " + report.path("risk").path("classification").asText(), ""));
+        if (report.has("baseline")) lines.add("Starting baseline: " + baselineLabel(report.path("baseline")));
+        if (report.has("savedBaseline")) lines.add("Saved baseline: " + baselineLabel(report.path("savedBaseline")));
+        if (report.has("ci")) {
+            var ci=report.path("ci");
+            lines.add("GitHub: " + ci.path("repository").asText() + " PR #" + ci.path("pullRequest").asText());
+            lines.add("Commit: " + ci.path("commit").asText());
+        }
         if (report.has("error")) lines.add("Execution error: " + report.path("error").asText());
         if (report.has("cleanupError")) lines.add("Cleanup error: " + report.path("cleanupError").asText());
         lines.add("WORKFLOW");
@@ -102,5 +109,12 @@ class ReportPdf {
         }
         result.add(ascii);
         return result;
+    }
+
+    private String baselineLabel(JsonNode baseline) {
+        String label=baseline.path("name").asText();
+        if (baseline.hasNonNull("id")) label="v" + baseline.path("id").asText() + " | " + label;
+        if (baseline.hasNonNull("sourceRunId")) label+=" | Source run #" + baseline.path("sourceRunId").asText();
+        return label;
     }
 }

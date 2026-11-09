@@ -1,17 +1,25 @@
 package dev.rehearsal;
 
 import jakarta.annotation.PreDestroy;
+import jakarta.validation.constraints.Positive;
+import jakarta.validation.constraints.Size;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 import org.flywaydb.core.api.FlywayException;
 import org.slf4j.*;
+import org.springframework.web.multipart.MultipartFile;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.sql.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Supplier;
 
 @Service
 class RunEngine {
+    record Request(@Positive Long baselineId,@Size(max=80) String saveBaselineAs) {}
+
     private static final Logger log=LoggerFactory.getLogger(RunEngine.class);
     private static final long CLUSTER_LOCK=787713936294L;
     private final WorkspaceStore store;
@@ -21,11 +29,12 @@ class RunEngine {
     private final ProjectService projects;
     private final ExecutionPolicy policy;
     private final MetadataLease lease;
+    private final BaselineStore baselines;
     private final Semaphore slots=new Semaphore(5);
     private final ExecutorService worker=Executors.newSingleThreadExecutor();
 
     RunEngine(WorkspaceStore store,DatabaseService databases,Analyzer analyzer,Sandbox sandbox,
-              ProjectService projects,ExecutionPolicy policy,MetadataLease lease) {
+              ProjectService projects,ExecutionPolicy policy,MetadataLease lease,BaselineStore baselines) {
         this.store=store;
         this.databases=databases;
         this.analyzer=analyzer;
@@ -33,25 +42,46 @@ class RunEngine {
         this.projects=projects;
         this.policy=policy;
         this.lease=lease;
+        this.baselines=baselines;
     }
 
-    WorkspaceStore.Run submit(long id,String email) {
+    WorkspaceStore.Run submit(long id,String email,Request request) {
+        return submit(() -> store.migration(id,email),email,request,null);
+    }
+
+    WorkspaceStore.Run submitCi(CiTokens.Access access,List<MultipartFile> files,WorkspaceStore.CiOrigin origin)
+            throws IOException {
+        try {
+            return submit(() -> {
+                try { return store.upload(access.projectId(),access.ownerEmail(),files); }
+                catch (IOException e) { throw new UncheckedIOException(e); }
+            },access.ownerEmail(),new Request(access.baselineId(),null),origin);
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
+        }
+    }
+
+    private WorkspaceStore.Run submit(Supplier<WorkspaceStore.Migration> source,String email,Request request,
+                                      WorkspaceStore.CiOrigin origin) {
         policy.requireEnabled();
         lease.requireActive();
         if (!slots.tryAcquire())
             throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS,"Rehearsal queue is full");
         try {
-            var migration=store.migration(id,email);
-            var input=databases.load(migration.projectId());
-            databases.requireFixture(input);
+            var migration=source.get();
+            Long baselineId=request==null ? null : request.baselineId();
+            var input=baselineId==null ? databases.load(migration.projectId()) : null;
+            if (input!=null) databases.requireFixture(input);
+            var save=snapshotRequest(request);
             var validation=analyzer.inspect(migration);
             if (!validation.valid()) throw WorkspaceStore.bad(validation.error());
             var probes=store.probes(migration.projectId(),email);
             long account=projects.account(email);
-            var run=store.createRun(migration,email);
+            var queued=store.createRun(migration,email,baselineId,save,origin);
+            var run=queued.run();
             try {
                 worker.execute(() -> {
-                    try { execute(run.id(),migration,input,probes,validation.findings(),account); }
+                    try { execute(queued,migration,input,probes,validation.findings(),account); }
                     catch (RuntimeException e) { recordFailure(run.id(),account,e); }
                     finally { slots.release(); }
                 });
@@ -66,22 +96,34 @@ class RunEngine {
         }
     }
 
-    private void execute(long id,WorkspaceStore.Migration migration,DatabaseService.Input input,
+    private BaselineStore.NewSnapshot snapshotRequest(Request request) {
+        if (request==null || request.saveBaselineAs()==null) return null;
+        String name=request.saveBaselineAs().strip();
+        if (name.isEmpty() || name.chars().anyMatch(Character::isISOControl))
+            throw WorkspaceStore.bad("Enter a non-empty baseline name without control characters.");
+        return new BaselineStore.NewSnapshot(name,sandbox.baselineName());
+    }
+
+    private void execute(WorkspaceStore.QueuedRun queued,WorkspaceStore.Migration migration,DatabaseService.Input input,
                          List<WorkspaceStore.Probe> probes,List<Risk.Finding> warnings,long account) {
-        var progress=new Progress(id,warnings);
+        long id=queued.run().id();
+        var progress=new Progress(queued.run(),warnings);
         String database=sandbox.name();
+        String template=queued.baseline()==null ? "sr_fixture" : queued.baseline().databaseName();
         String status="FAILED";
         try (var broker=sandbox.broker()) {
             lease.requireActive();
             policy.verify(broker);
             lockAndRecover(broker);
             try {
-                try (var baseline=databases.connect(input)) {
-                    policy.verifyFixture(baseline);
-                    progress.data.put("registeredSchema",Schema.capture(baseline));
+                if (input!=null) {
+                    try (var baseline=databases.connect(input)) {
+                        policy.verifyFixture(baseline);
+                        progress.data.put("registeredSchema",Schema.capture(baseline));
+                    }
                 }
                 progress.advance("Temporary database");
-                sandbox.provision(broker,database);
+                sandbox.provision(broker,database,template);
                 Map<String,String> before;
                 List<Schema.UncoveredForeignKey> uncoveredBefore;
                 Map<Long,Compatibility.Result> baselineResults=new HashMap<>();
@@ -132,6 +174,10 @@ class RunEngine {
                     }
                     progress.data.put("compatibility",comparisons);
                 }
+                if (queued.snapshot()!=null) {
+                    progress.advance("Save baseline snapshot");
+                    sandbox.saveBaseline(broker,database,queued.snapshot().databaseName());
+                }
                 status="SUCCEEDED";
             } finally {
                 cleanup(broker,database,progress);
@@ -151,7 +197,7 @@ class RunEngine {
         progress.advance("Final report");
         progress.endStep("SUCCEEDED");
         if (progress.data.containsKey("cleanupError")) status="FAILED";
-        store.finishRun(id,status,score.score(),millis(progress.started),progress.data,account);
+        store.finishRun(id,status,score.score(),millis(progress.started),progress.data,account,queued.snapshot());
         log.info("Rehearsal {} completed status={} durationMs={}",id,status,millis(progress.started));
     }
 
@@ -190,6 +236,15 @@ class RunEngine {
             while (rows.next()) stale.add(rows.getString(1));
         }
         for (String name:stale) sandbox.drop(broker,name);
+        // Reclaim only known allocations from this metadata database, never other snapshots on the cluster.
+        for (String name:baselines.reclaimable()) {
+            try {
+                sandbox.dropBaseline(broker,name);
+                baselines.forget(name);
+            } catch (SQLException e) {
+                log.warn("A removed baseline could not be reclaimed (SQLSTATE {})",e.getSQLState());
+            }
+        }
     }
 
     private void cleanup(Connection broker,String database,Progress progress) {
@@ -236,9 +291,10 @@ class RunEngine {
         long stepStarted=System.nanoTime();
         boolean open=true;
 
-        Progress(long id,List<Risk.Finding> initial) {
-            this.id=id;
+        Progress(WorkspaceStore.Run run,List<Risk.Finding> initial) {
+            this.id=run.id();
             findings=new ArrayList<>(initial);
+            data.putAll(run.report());
             data.put("steps",steps);
             data.put("findings",findings);
         }

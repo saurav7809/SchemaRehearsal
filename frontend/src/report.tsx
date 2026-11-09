@@ -4,7 +4,8 @@ import { ArrowLeft, Check, Circle, Clock3, Download, FileCheck2, LoaderCircle, X
 import { api, date, errorMessage, pending, useResource, type QueryResult, type Run } from './api'
 import { Badge, Empty, Heading, Notice } from './ui'
 
-const stages = ['Database snapshot', 'Temporary database', 'Migration execution', 'Compatibility testing', 'Risk analysis', 'Final report']
+const saveBaselineStage = 'Save baseline snapshot'
+const stages = ['Database snapshot', 'Temporary database', 'Migration execution', 'Compatibility testing', saveBaselineStage, 'Risk analysis', 'Final report']
 
 export function ReportPage() {
   const { id } = useParams()
@@ -57,6 +58,7 @@ function ReportDetail({ id }: { id: string }) {
   </>
   const report = run.report
   const scoring = report.risk
+  const runStages = report.saveBaselineAs ? stages : stages.filter(name => name !== saveBaselineStage)
   return <><Link className="text-link back" to="/reports"><ArrowLeft size={15} /> Reports</Link>
     <Heading eyebrow={'REHEARSAL #' + run.id} title={run.migrationName} description={date(run.createdAt) + ' · ' + run.durationMs + ' ms elapsed'} action={active ? <Badge value={run.status} /> : <a className="button primary" href={'/api/reports/' + run.id + '/download'} aria-disabled={downloading} onClick={event => void downloadReport(event, run.id)}><Download size={17} /> {downloading ? 'Downloading…' : 'Download PDF'}</a>} />
     {resource.error && <Notice error>
@@ -66,9 +68,31 @@ function ReportDetail({ id }: { id: string }) {
     {downloadError && <Notice error>{downloadError}</Notice>}
     {report.error && <Notice error><strong>Rehearsal error</strong><pre className="error-evidence">{report.error}</pre></Notice>}
     {report.cleanupError && <Notice error>Temporary database cleanup failed. {report.cleanupError}</Notice>}
+    {report.ci && <section className="panel section" aria-labelledby="report-ci-title">
+      <div className="section-heading"><h2 id="report-ci-title">GitHub CI provenance</h2></div>
+      <dl className="baseline-summary">
+        <div><dt>Pull request</dt><dd>{report.ci.repository} #{report.ci.pullRequest}</dd></div>
+        <div><dt>Commit</dt><dd><code>{report.ci.commit}</code></dd></div>
+      </dl>
+    </section>}
+    {(report.baseline || report.saveBaselineAs || report.savedBaseline) && <section className="panel section" aria-labelledby="report-baseline-title">
+      <div className="section-heading"><h2 id="report-baseline-title">Rehearsal baselines</h2>
+        <Link className="text-link" to={'/projects/' + run.projectId + '?tab=Baselines'}>Project baselines</Link>
+      </div>
+      <dl className="baseline-summary">
+        {report.baseline && <div><dt>Starting baseline</dt><dd>
+          {report.baseline.id != null && <code>v{report.baseline.id} · </code>}{report.baseline.name}
+          {report.baseline.sourceRunId != null && <Link className="text-link" to={'/reports/' + report.baseline.sourceRunId}>Source run #{report.baseline.sourceRunId}</Link>}
+        </dd></div>}
+        {report.savedBaseline && <div><dt>Saved baseline</dt><dd>
+          <code>v{report.savedBaseline.id} · </code>{report.savedBaseline.name}
+        </dd></div>}
+        {report.saveBaselineAs && !report.savedBaseline && <div><dt>Requested baseline</dt><dd>{report.saveBaselineAs}</dd></div>}
+      </dl>
+    </section>}
     <div className="split report-grid"><section className="panel section">
       <div className="section-heading"><div><p className="eyebrow">EXECUTION TIMELINE</p><h2>Testing workflow</h2></div><Badge value={run.status} /></div>
-      <ol className="steps">{stages.map(name => {
+      <ol className="steps">{runStages.map(name => {
         const step = report.steps?.find(item => item.name === name)
         const running = report.activeStep === name || active && run.status === 'QUEUED' && name === stages[0]
         const status = step?.status ?? (running ? 'RUNNING' : active ? 'PENDING' : 'SKIPPED')

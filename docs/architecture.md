@@ -4,14 +4,15 @@ React and Vite provide a same-origin workspace. The loopback Spring Boot API han
 
 ## Rehearsal lifecycle
 
-1. Confirm ownership, resolve a saved baseline, validate the upload, and capture the current query list.
+1. Confirm ownership, resolve the shared fixture or selected project baseline, validate the upload, and capture the current query list.
 2. Persist a queued run and schedule it on one worker with up to five accepted submissions and two active runs per account.
 3. Acquire a cluster advisory lock through the broker. Recover abandoned databases owned by the broker whose names match the reserved run format.
-4. Inspect the registered fixture read-only. Clone it into a random `sr_run_` database. Apply the connection limit and grant worker access.
+4. Clone the selected source into a random `sr_run_` database. Apply the connection limit and grant worker access to the run database.
 5. Capture the clone's public schema and run old SELECT probes. Release all probe connections before migration.
 6. Stage the selected SQL files and invoke Flyway once on the clone. A single plain SQL file is staged as `V1__uploaded.sql`. Flyway versioned and repeatable filenames are preserved. Files run in Flyway order, and the report records each file's outcome and available timing and error evidence.
 7. Capture the migrated schema, compare definitions, and run old and new probes. Compare execution and result column names and PostgreSQL types. Rows are sampled for count only, up to 100.
-8. Drop the temporary database in a finally block, compute risk, and persist the final report and audit event.
+8. If requested and the rehearsal succeeds, seal a broker-owned `sr_baseline_` clone of its schema and data. Reset Flyway history in the saved snapshot so later rehearsals can use their own migration versions.
+9. Drop the temporary database in a finally block, compute risk, and persist the final report and audit event.
 
 Run one API instance per metadata database. The API holds a PostgreSQL advisory lease while it owns the queue. After acquiring the lease at startup, it marks interrupted runs as failed. The next rehearsal recovers abandoned clone databases. A run can succeed at Flyway and still show a compatibility regression. A PostgreSQL failure includes the real SQLSTATE and message. Schema comparisons cover public relations, columns, constraints, and indexes. Rename-like differences can appear as a removal plus an addition. SQLGlot may separately detect explicit renames.
 
@@ -27,11 +28,12 @@ Each distinct static or observed finding contributes LOW 5, MEDIUM 12, HIGH 26, 
 | `projects` | Owner FK, name, description, PostgreSQL version, creation time |
 | `database_configs` | Project PK/FK, endpoint, role, AES-GCM ciphertext with per-write nonce |
 | `migrations` | Project FK, display name, upload time, and either single-file SQL or an ordered JSONB bundle |
+| `project_baselines` | Project-owned version labels, internal cluster clone names, source run IDs, and publication state |
 | `probes` | Project FK, old or new application generation, SELECT text |
 | `test_runs` | Project and migration FKs, status, duration, score, and report JSONB |
 | `audit_events` | Account FK, action, subject ID, timestamp |
 
-Report JSONB contains immutable completed-run snapshots, per-file migration outcomes, schema differences, query comparisons, findings, recommendations, and score factors. The report and the run share an ID. Project-owned configuration, migrations, probes, and runs cascade on project deletion. Audit events retain their numeric subject. The Flyway DDL documents the indexes and constraints.
+Report JSONB contains immutable completed-run snapshots, baseline identity, per-file migration outcomes, schema differences, query comparisons, findings, recommendations, and score factors. Baseline identity in a report survives deletion of that saved version. The report and the run share an ID. Project-owned configuration, migrations, probes, runs, and baselines are removed on project deletion. Audit events retain their numeric subject. The Flyway DDL documents the indexes and constraints.
 
 ## Production security boundary
 
@@ -41,7 +43,8 @@ Production rehearsal requires an operator-controlled PostgreSQL 18 cluster. The 
 
 ## Supported workloads and limits
 
-- Use synthetic or approved test data. In the local development profile, the backend inspects local registered databases through read-only transactions. Rehearsals in both profiles require the operator-controlled `sr_fixture` and reader role. Import custom representative data out of band with an operator account. Projects share the fixture. Keep it idle during runs. The broker provisions and removes temporary databases. Flyway connects as the worker to apply the migration.
+- Use synthetic or approved test data. In the local development profile, the backend inspects local registered databases through read-only transactions. Rehearsals start from the operator-controlled `sr_fixture` or a saved project baseline. Import custom representative fixture data out of band with an operator account. Keep the shared fixture idle during runs. Flyway connects as the worker to apply migrations to the disposable clone.
+- Saved baselines come from completed rehearsals and belong to one project. Their PostgreSQL databases disallow connections and are cloned only by the broker. Each saved version occupies disk space until deleted and reclaimed during a subsequent rehearsal under the cluster lock.
 - Apply the PostgreSQL host authentication rules. They restrict the worker login to run databases and deny app roles from other cluster databases. The worker is neither database owner nor a cluster administrator. Only the worker can change the fixture objects within a disposable clone.
 - SQLGlot blocks unsupported statement families, cross-schema objects, and mutating probes. PostgreSQL privileges, read-only transactions, connection limits, timeouts, and forced cleanup provide separate controls. The SQL policy covers a subset of PostgreSQL syntax. PostgreSQL is the authority on actual execution.
 - Uploads accept up to 20 SQL files and 256 KiB of SQL total. Bundles use Flyway versioned or repeatable names and require unique versions and repeatable descriptions. Validation allows up to 100 statements per upload. Probes are read-only SELECTs.

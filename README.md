@@ -66,18 +66,26 @@ Open [SchemaRehearsal](http://127.0.0.1:5173). Vite forwards same-origin API req
 
 To rehearse changes together, select multiple Flyway SQL files in a single upload. For example, pair `V1__add_notes.sql` with `V2__rename_notes.sql`. Each run applies the selected bundle to one fresh clone in Flyway order. Open the report to see which files applied, which file failed, and which files remained pending.
 
+## Rehearse against a saved release
+
+Choose the shared fixture or a saved project baseline when starting a rehearsal. To capture the resulting schema and data as a new version, enter a baseline label before starting the run. A successful run saves an immutable baseline that the same project can select for future rehearsals. Each run uses a fresh clone of the selected version, and its report records the baseline and originating run. Projects can retain up to five versions. Deleting one removes it from future selections while existing reports retain its identity.
+
+## Rehearse pull requests with GitHub Actions
+
+The [opt-in CI guide](docs/github-ci.md) shows how to bind a project token to a saved baseline and rehearse reviewed SQL changes from a same-repository pull request. The workflow publishes a commit status and report summary against the pull request head.
+
 ## Verification
 
 Run from the repository root.
 
 ```powershell
 mvn.cmd -f backend/pom.xml test
-.\.venv\Scripts\python.exe -m pytest analysis -q
+.\.venv\Scripts\python.exe -m pytest analysis scripts -q
 npm.cmd --prefix frontend run build
 .\scripts\smoke.ps1
 ```
 
-The smoke script needs a running backend and a disposable development cluster. It registers test accounts and leaves results available for inspection. It checks the original demo, versioned and repeatable migration ordering, a conflict that occurs only when files run together, duplicate Flyway version rejection, and upload size and file count limits. Use `-BaseUrl http://127.0.0.1:5173` to test through the Vite proxy.
+The smoke script needs a running backend and a disposable development cluster. It registers test accounts and leaves results available for inspection. It checks the original demo, Flyway bundle ordering and upload limits, and contrasting outcomes for the same migration against two saved project baselines. Use `-BaseUrl http://127.0.0.1:5173` to test through the Vite proxy.
 
 - [Windows and PostgreSQL setup](docs/windows.md)
 - [Production deployment and operations](docs/production.md)

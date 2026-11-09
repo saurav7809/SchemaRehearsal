@@ -28,14 +28,18 @@ class WorkspaceStore {
     record Probe(long id,String name,String generation,String sql) {}
     record Run(long id,long projectId,long migrationId,String migrationName,String status,int score,
                Instant createdAt,long durationMs,Map<String,Object> report) {}
+    record QueuedRun(Run run,BaselineStore.Stored baseline,BaselineStore.Stored snapshot) {}
+    record CiOrigin(String repository,long pullRequest,String commit) {}
 
     private final JdbcTemplate jdbc;
     private final ProjectService projects;
     private final ObjectMapper json;
-    WorkspaceStore(JdbcTemplate jdbc, ProjectService projects, ObjectMapper json) {
+    private final BaselineStore baselines;
+    WorkspaceStore(JdbcTemplate jdbc, ProjectService projects, ObjectMapper json,BaselineStore baselines) {
         this.jdbc=jdbc;
         this.projects=projects;
         this.json=json;
+        this.baselines=baselines;
     }
 
     static ResponseStatusException bad(String reason) { return new ResponseStatusException(HttpStatus.BAD_REQUEST,reason); }
@@ -166,41 +170,58 @@ class WorkspaceStore {
     }
 
     @Transactional
-    Run createRun(Migration migration,String email) {
+    QueuedRun createRun(Migration migration,String email,Long baselineId,BaselineStore.NewSnapshot save,CiOrigin origin) {
         long account=projects.account(email);
-        jdbc.queryForObject("select id from accounts where id=? for update",Long.class,account);
+        // Serialize the account quota check without blocking audit foreign-key checks.
+        jdbc.queryForObject("select id from accounts where id=? for no key update",Long.class,account);
         var rows=jdbc.queryForList("select id from projects where id=? and owner_id=? for update",
             Long.class,migration.projectId(),account);
         if (rows.isEmpty()) throw ProjectService.missing();
+        var baseline=baselineId==null ? null : baselines.require(migration.projectId(),baselineId);
         if (jdbc.queryForObject("""
             select count(*) from test_runs r join projects p on p.id=r.project_id
             where p.owner_id=? and r.status in ('QUEUED','RUNNING')
             """,Integer.class,account)>=2)
             throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS,
                 "An account can have up to two active rehearsals.");
+        Map<String,Object> report=new LinkedHashMap<>();
+        report.put("baseline",baseline==null ? Map.of("name","Shared fixture") : baseline.view());
+        if (save!=null) report.put("saveBaselineAs",save.name());
+        if (origin!=null) report.put("ci",origin);
         var run=jdbc.queryForObject("""
-            insert into test_runs(project_id,migration_id,migration_name,status,score,duration_ms,report)
-            values (?,?,?,'QUEUED',0,0,'{}') returning *
-            """,this::runRow,migration.projectId(),migration.id(),migration.name());
+            insert into test_runs(project_id,migration_id,migration_name,status,score,duration_ms,report,ci_submission)
+            values (?,?,?,'QUEUED',0,0,?::jsonb,?) returning *
+            """,this::runRow,migration.projectId(),migration.id(),migration.name(),writeReport(report),origin!=null);
+        var snapshot=save==null ? null : baselines.reserve(migration.projectId(),run.id(),save);
         projects.audit(account,"TEST_QUEUED",run.id());
-        return run;
+        return new QueuedRun(run,baseline,snapshot);
     }
 
     int updateRun(long id,String status,int score,long duration,Map<String,Object> report) {
+        return jdbc.update("""
+            update test_runs set status=?,score=?,duration_ms=?,report=?::jsonb
+            where id=? and status in ('QUEUED','RUNNING')
+            """,status,score,duration,writeReport(report),id);
+    }
+
+    private String writeReport(Map<String,Object> report) {
         try {
-            return jdbc.update("""
-                update test_runs set status=?,score=?,duration_ms=?,report=?::jsonb
-                where id=? and status in ('QUEUED','RUNNING')
-                """,
-                status,score,duration,json.writeValueAsString(report),id);
+            return json.writeValueAsString(report);
         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
             throw new IllegalStateException("Could not serialize report",e);
         }
     }
 
     @Transactional
-    void finishRun(long id,String status,int score,long duration,Map<String,Object> report,long account) {
-        if (updateRun(id,status,score,duration,report)==1) projects.audit(account,"TEST_" + status,id);
+    void finishRun(long id,String status,int score,long duration,Map<String,Object> report,long account,
+                   BaselineStore.Stored snapshot) {
+        boolean publish=snapshot!=null && status.equals("SUCCEEDED");
+        if (publish) report.put("savedBaseline",baselines.publish(snapshot.view().id(),id,account));
+        if (updateRun(id,status,score,duration,report)==1) {
+            projects.audit(account,"TEST_" + status,id);
+        } else if (publish) {
+            throw new IllegalStateException("The rehearsal is no longer active.");
+        }
     }
 
     @Transactional
@@ -229,6 +250,14 @@ class WorkspaceStore {
         return jdbc.query("""
             select r.* from test_runs r join projects p on p.id=r.project_id where r.id=? and p.owner_id=?
             """,this::runRow,id,projects.account(email)).stream().findFirst().orElseThrow(ProjectService::missing);
+    }
+
+    Run ciRun(long id,CiTokens.Access access) {
+        return jdbc.query("""
+            select * from test_runs where id=? and project_id=? and ci_submission
+                and report #>> '{baseline,id}'=?
+            """,this::runRow,id,access.projectId(),Long.toString(access.baselineId()))
+            .stream().findFirst().orElseThrow(ProjectService::missing);
     }
 
     List<Run> runs(Long projectId,String email) {

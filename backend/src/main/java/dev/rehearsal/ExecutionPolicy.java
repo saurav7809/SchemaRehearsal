@@ -70,7 +70,10 @@ class ExecutionPolicy implements HealthIndicator {
                       and pg_get_userbyid(datdba)='sr_broker')=2
                 and not exists (select 1 from pg_database
                     where datname not in ('postgres','template0','template1','sr_control','sr_fixture')
-                      and (datname !~ '^sr_run_[a-f0-9]{32}$' or pg_get_userbyid(datdba)<>'sr_broker'))
+                      and not (pg_get_userbyid(datdba)='sr_broker' and (
+                          datname ~ '^sr_run_[a-f0-9]{32}$' or
+                          (datname ~ '^sr_baseline_[a-f0-9]{32}$' and not datallowconn and not datistemplate)
+                      )))
                 and not has_database_privilege('sr_worker','sr_control','CONNECT')
                 and not has_database_privilege('sr_worker','sr_fixture','CONNECT')
             from pg_catalog.pg_control_system()

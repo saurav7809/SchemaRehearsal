@@ -21,8 +21,8 @@ python -m venv .venv
 if ($LASTEXITCODE) { throw 'Python environment creation failed' }
 .\.venv\Scripts\python.exe -m pip install -r analysis/requirements.txt
 if ($LASTEXITCODE) { throw 'Analyzer dependency install failed' }
-.\.venv\Scripts\python.exe -m pytest analysis -q
-if ($LASTEXITCODE) { throw 'Analyzer tests failed' }
+.\.venv\Scripts\python.exe -m pytest analysis scripts -q
+if ($LASTEXITCODE) { throw 'Python tests failed' }
 ```
 
 Retain the JAR from `backend/target`, `frontend/dist`, the analyzer source and pinned dependencies, and the deployment and database files as one versioned release. Recreate the virtual environment on the deployment host at its final path. Scan the release dependencies against your vulnerability policy and retain the scan result and artifact hashes.
@@ -81,7 +81,7 @@ psql -X -h 127.0.0.1 -p 55432 -U sr_broker -d sr_control -c 'SELECT system_ident
 psql -X -h 127.0.0.1 -p 55432 -U sr_worker -d sr_fixture -c 'SELECT 1'
 ```
 
-The first two queries should return zero errors, the identifiers should differ, and the worker login to the fixture should be rejected. The rehearsal instance is reserved for `sr_control`, `sr_fixture`, PostgreSQL's built-in databases, and disposable `sr_run_*` databases. Keep business databases and the `sr_app` role on other instances. Keep the rehearsal instance free of extensions or role memberships that permit file access, outbound connections, or privilege escalation. Only the read-only `sr_reader` role should connect to the fixture from the application. Restrict the rehearsal service account's filesystem and outbound network access with host policy.
+The first two queries should return zero errors, the identifiers should differ, and the worker login to the fixture should be rejected. The rehearsal instance is reserved for `sr_control`, `sr_fixture`, PostgreSQL's built-in databases, disposable `sr_run_*` databases, and broker-owned `sr_baseline_*` databases with connections disabled. Keep business databases and the `sr_app` role on other instances. Keep the rehearsal instance free of extensions or role memberships that permit file access, outbound connections, or privilege escalation. Only the read-only `sr_reader` role should connect to the shared fixture from the application. Restrict the rehearsal service account's filesystem and outbound network access with host policy.
 
 ## 3. Configure and run the API
 
@@ -149,15 +149,17 @@ Before admitting operators or enabling execution, record the following release c
 - Confirm both health endpoints respond on the management listener and `/actuator/health/readiness` is blocked at the proxy.
 - Confirm login, logout, CSRF rejection, registration disabled, project ownership checks, and the report download through the HTTPS origin. Apply gateway-level rate limiting for your ingress. The default production profile uses Caddy's loopback address as the peer, so clients share the API's per-address authentication budget.
 - Verify the database allowlist, role isolation, separate system identifiers, and constrained rehearsal volume. Confirm the PostgreSQL instances use unique credentials.
-- Run [the smoke test](../scripts/smoke.ps1) only on a disposable staging installation with test account registration and execution explicitly enabled. Exercise single-file migrations, a dependent Flyway bundle, file-level failure evidence, a breaking query, and PDF download. Confirm no disposable database remains.
-- Measure sustained load with representative fixture sizes. Record acceptance limits for latency, throughput, and disk consumption. Set backup recovery objectives and validate a restore before the first release.
+- Run [the smoke test](../scripts/smoke.ps1) only on a disposable staging installation with test account registration and execution explicitly enabled. Exercise single-file migrations, a dependent Flyway bundle, file-level failure evidence, a breaking query, two saved baselines, and PDF download. Confirm disposable databases and deleted staging baseline clones are reclaimed.
+- Measure sustained load with representative fixture sizes. Record acceptance limits for latency, throughput, and disk consumption. Account for up to five saved copies of the schema and data per project, an active run clone, a new snapshot during promotion, and WAL. Set a storage quota and alert on available capacity. Set backup recovery objectives and validate a restore before the first release.
 - Explicitly set `SR_EXECUTION_ENABLED=true` and restart only after the isolation checks pass for that environment. Confirm that a test rehearsal runs on the rehearsal instance. Leave execution disabled if isolation or trusted-operator controls cannot be verified.
 
-For an incident, restrict ingress, preserve logs and reports, and restart in execution-disabled mode. Review the rehearsal server logs and inspect leftover databases before re-enabling execution. The application uses reserved run names and owner checks to reclaim abandoned clones. Avoid broad manual database deletions. For a planned upgrade, restrict ingress, let submitted rehearsals finish, take backups, stop the API, then install the new release and check readiness before reopening access. Interrupted runs require resubmission.
+For an incident, restrict ingress, preserve logs and reports, and restart in execution-disabled mode. Review the rehearsal server logs and inspect leftover databases before re-enabling execution. The application uses reserved run names and owner checks to reclaim abandoned runs. Saved clone cleanup during a subsequent rehearsal is limited to reserved database names tracked for reclamation by the matching metadata database. Avoid broad manual database deletions. For a planned upgrade, restrict ingress, let submitted rehearsals finish, take backups, stop the API, then install the new release and check readiness before reopening access. Interrupted runs require resubmission.
+
+For pull request checks, use a separate internal staging project and the approval-protected [GitHub workflow](github-ci.md). Bind its CI token to a saved baseline with sanitized data.
 
 ## Back up and restore
 
-Back up metadata and any approved fixture on an access-controlled, encrypted destination separate from the databases. Use a PostgreSQL 18 backup client and a protected passfile or credential provider for scheduled execution. Metadata dumps contain account hashes, SQL, reports, and encrypted database credentials. Retain the release artifacts and encryption key in separately protected storage. Transient rehearsal databases are disposable.
+Back up metadata and any approved fixture on an access-controlled, encrypted destination separate from the databases. Use a PostgreSQL 18 backup client and a protected passfile or credential provider for scheduled execution. Metadata dumps contain account hashes, SQL, reports, encrypted database credentials, and references to saved baselines. Retain the release artifacts and encryption key in separately protected storage. The following logical dumps cover metadata and the shared fixture. Use the paired strategy below when retaining named baselines.
 
 ```powershell
 $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
@@ -167,4 +169,6 @@ pg_dump -h 127.0.0.1 -p 55432 -U sr_exec_setup -d sr_fixture -Fc -f "F:\Rehearsa
 if ($LASTEXITCODE) { throw 'Fixture backup failed' }
 ```
 
-Pause rehearsals during fixture backup so the backup session does not compete with cloning. Test restoration on fresh staging PostgreSQL instances with the same role names, bootstrapped HBA rules, and the matching application release. Restore into those staging databases with `pg_restore --exit-on-error --single-transaction`. A seeded fixture restore also needs `--clean --if-exists` so the restored tables can replace the bootstrap seed. Keep the backed-up ownership and grants, and provide the original encryption key and matching reader password when validating restored connections. Record actual recovery time and verify account login, historical reports, and a rehearsal against the restored fixture. Logical backups recover the selected dump, so configure and test an approved WAL/PITR strategy if your recovery-point target is shorter than the backup interval. [PostgreSQL backup and restore](https://www.postgresql.org/docs/18/backup.html)
+Pause rehearsals during fixture backup so the backup session does not compete with cloning. Test logical restoration on fresh staging PostgreSQL instances with the same role names, bootstrapped HBA rules, and the matching application release. Restore into those staging databases with `pg_restore --exit-on-error --single-transaction`. A seeded fixture restore also needs `--clean --if-exists` so the restored tables can replace the bootstrap seed. Keep the backed-up ownership and grants, and provide the original encryption key and matching reader password when validating restored connections. [PostgreSQL backup and restore](https://www.postgresql.org/docs/18/backup.html)
+
+Saved baselines are full PostgreSQL databases with connections disabled. To preserve them, drain rehearsals and stop the API, then capture the metadata and rehearsal clusters as a matched backup set using your approved physical PostgreSQL backup process. For filesystem copies, stop both PostgreSQL instances and capture both complete clusters, including any external WAL or tablespaces. Restore the pair in staging and verify baseline lists, historical reports, and a rehearsal against a restored saved version before allowing production use. Record actual recovery time and test an approved WAL/PITR strategy if your recovery-point target is shorter than the backup interval. [PostgreSQL filesystem backups](https://www.postgresql.org/docs/18/backup-file.html) · [PostgreSQL point-in-time recovery](https://www.postgresql.org/docs/18/continuous-archiving.html)

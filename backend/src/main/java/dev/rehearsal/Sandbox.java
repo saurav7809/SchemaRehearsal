@@ -37,17 +37,61 @@ class Sandbox {
 
     String name() { return "sr_run_" + UUID.randomUUID().toString().replace("-",""); }
 
-    void provision(Connection broker,String name) throws SQLException {
+    String baselineName() { return "sr_baseline_" + UUID.randomUUID().toString().replace("-",""); }
+
+    void provision(Connection broker,String name,String template) throws SQLException {
         checkName(name);
+        boolean savedBaseline = !"sr_fixture".equals(template);
+        if (savedBaseline) checkBaselineName(template);
+        requireCloneSource(broker,template,savedBaseline);
         try (var command=broker.createStatement()) {
-            command.execute("CREATE DATABASE " + name + " TEMPLATE sr_fixture CONNECTION LIMIT 4");
+            command.execute("CREATE DATABASE " + name + " TEMPLATE " + template
+                + " ALLOW_CONNECTIONS false IS_TEMPLATE false CONNECTION LIMIT 4");
             command.execute("REVOKE ALL ON DATABASE " + name + " FROM PUBLIC");
             command.execute("GRANT CONNECT ON DATABASE " + name + " TO sr_worker");
+            command.execute("ALTER DATABASE " + name + " ALLOW_CONNECTIONS true");
+        }
+    }
+
+    void saveBaseline(Connection broker,String runName,String baselineName) throws SQLException {
+        checkName(runName);
+        checkBaselineName(baselineName);
+        requireCloneSource(broker,runName,false);
+        try (var connection=worker(runName); var command=connection.createStatement()) {
+            command.execute("DROP TABLE IF EXISTS public.flyway_schema_history");
+        }
+        try (var command=broker.createStatement()) {
+            command.execute("CREATE DATABASE " + baselineName + " TEMPLATE " + runName
+                + " ALLOW_CONNECTIONS false IS_TEMPLATE false");
+            command.execute("REVOKE ALL ON DATABASE " + baselineName + " FROM PUBLIC");
+        }
+    }
+
+    private static void requireCloneSource(Connection broker,String source,boolean sealed) throws SQLException {
+        try (var query=broker.prepareStatement("""
+            select 1 from pg_catalog.pg_database
+            where datname=? and current_database()='sr_control' and current_user='sr_broker'
+                and pg_catalog.pg_get_userbyid(datdba)=current_user and not datistemplate and datallowconn=?
+            """)) {
+            query.setString(1,source);
+            query.setBoolean(2,!sealed);
+            try (var result=query.executeQuery()) {
+                if (!result.next()) throw new SQLException("The rehearsal clone source is unavailable or has invalid isolation settings.");
+            }
         }
     }
 
     void drop(Connection broker,String name) throws SQLException {
         checkName(name);
+        dropDatabase(broker,name);
+    }
+
+    void dropBaseline(Connection broker,String name) throws SQLException {
+        checkBaselineName(name);
+        dropDatabase(broker,name);
+    }
+
+    private static void dropDatabase(Connection broker,String name) throws SQLException {
         try (var command=broker.createStatement()) {
             command.execute("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)");
         }
@@ -174,6 +218,12 @@ class Sandbox {
     }
 
     private static void checkName(String name) {
-        if (!name.matches("sr_run_[a-f0-9]{32}")) throw new IllegalArgumentException("Invalid sandbox identifier");
+        if (name == null || !name.matches("sr_run_[a-f0-9]{32}"))
+            throw new IllegalArgumentException("Invalid sandbox identifier");
+    }
+
+    private static void checkBaselineName(String name) {
+        if (name == null || !name.matches("sr_baseline_[a-f0-9]{32}"))
+            throw new IllegalArgumentException("Invalid saved baseline identifier");
     }
 }

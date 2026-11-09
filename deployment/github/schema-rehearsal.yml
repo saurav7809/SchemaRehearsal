@@ -1,0 +1,43 @@
+# Install under .github/workflows only after configuring the protected environment.
+name: Rehearse SQL changes
+
+'on':
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: schema-rehearsal-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rehearse:
+    name: Rehearse approved migration SQL
+    if: ${{ github.event.pull_request.head.repo.id == github.event.repository.id }}
+    environment: schema-rehearsal
+    runs-on: [self-hosted, Windows, X64, schema-rehearsal]
+    timeout-minutes: 15
+    steps:
+      - name: Check out the protected base commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: trusted-base
+
+      - name: Submit migration files and publish the head commit status
+        working-directory: trusted-base
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SR_CI_URL: ${{ secrets.SR_CI_URL }}
+          SR_CI_TOKEN: ${{ secrets.SR_CI_TOKEN }}
+          SR_MIGRATIONS_PATH: ${{ vars.SR_MIGRATIONS_PATH }}
+          SR_REPORT_URL: ${{ vars.SR_REPORT_URL }}
+        run: python -I scripts/github_rehearsal.py

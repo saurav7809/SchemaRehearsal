@@ -1,10 +1,11 @@
 import { useState, type FormEvent } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, Braces, Database, FlaskConical, Play, Plus, ShieldCheck, Trash2, Upload } from 'lucide-react'
-import { api, date, errorMessage, useResource, type Finding, type Migration, type Probe, type Project, type Run } from './api'
+import { api, date, errorMessage, useResource, type Finding, type Migration, type Probe, type Project, type ProjectBaseline, type Run } from './api'
+import { ProjectCi } from './ci'
 import { Badge, Empty, Heading, Notice, RunsTable } from './ui'
 
-const sections = ['Migrations', 'Database', 'Compatibility', 'Test history', 'Settings'] as const
+const sections = ['Migrations', 'Database', 'Baselines', 'Compatibility', 'Test history', 'GitHub CI', 'Settings'] as const
 const maxMigrationFiles = 20
 const maxMigrationBytes = 256 * 1024
 
@@ -25,14 +26,17 @@ function ProjectWorkspace({ id }: { id: string }) {
     <div className="tabs" aria-label="Project sections">{sections.map(item => <button className={section === item ? 'selected' : ''} aria-pressed={section === item} key={item} onClick={() => setSearch(item === sections[0] ? {} : { tab: item })}>{item}</button>)}</div>
     {section === 'Migrations' && <Migrations id={id} />}
     {section === 'Database' && <DatabasePanel id={id} />}
+    {section === 'Baselines' && <Baselines id={id} />}
     {section === 'Compatibility' && <Queries id={id} />}
     {section === 'Test history' && <History id={id} />}
+    {section === 'GitHub CI' && <ProjectCi id={id} />}
     {section === 'Settings' && <Settings project={project.data} reload={project.reload} />}
   </>
 }
 
 function Migrations({ id }: { id: string }) {
   const migrations = useResource<Migration[]>('/projects/' + id + '/migrations')
+  const baselines = useResource<ProjectBaseline[]>('/projects/' + id + '/baselines')
   const navigate = useNavigate()
   const [selected, setSelected] = useState<number>()
   const [previewName, setPreviewName] = useState('')
@@ -68,8 +72,12 @@ function Migrations({ id }: { id: string }) {
       } else if (migration && name === 'validate') {
         const { data } = await api.post('/migrations/' + migration.id + '/validate')
         setValidation({ ...data, id: migration.id })
-      } else if (migration && name === 'test') {
-        const { data } = await api.post<Run>('/migrations/' + migration.id + '/test')
+      } else if (migration && name === 'test' && form) {
+        const values = new FormData(form)
+        const baselineId = Number(values.get('baselineId')) || undefined
+        const saveBaselineAs = String(values.get('saveBaselineAs') ?? '').trim() || undefined
+        const options = baselineId || saveBaselineAs ? { baselineId, saveBaselineAs } : undefined
+        const { data } = await api.post<Run>('/migrations/' + migration.id + '/test', options)
         navigate('/reports/' + data.id)
       }
     } catch (e) { setError(errorMessage(e)) }
@@ -98,8 +106,58 @@ function Migrations({ id }: { id: string }) {
           : 'SQL parsed and passed the rehearsal policy. Static findings: ') + currentValidation.findings.length
         : currentValidation.error}</Notice>}
       {currentValidation?.findings.map((f, i) => <div className="line-item" key={i}><Badge value={f.severity} /><span>{f.title}{f.filename && <> · <code>{f.filename}</code></>}</span></div>)}
-      <div className="actions"><button className="button secondary" disabled={!!busy} onClick={() => action('validate')}><ShieldCheck size={16} /> {busy === 'validate' ? 'Validating…' : 'Validate SQL'}</button><button className="button primary" disabled={!!busy} onClick={() => action('test')}><Play size={16} /> {busy === 'test' ? 'Queuing…' : 'Run rehearsal'}</button></div>
+      <form key={migration.id} className="form-stack rehearsal-options" aria-busy={busy === 'test'} onSubmit={event => action('test', event)}>
+        <h3>Rehearsal options</h3>
+        <label>Starting baseline<select name="baselineId" disabled={baselines.loading || busy === 'test'}>
+          <option value="">Shared fixture (default)</option>
+          {baselines.data?.map(baseline => <option value={baseline.id} key={baseline.id}>v{baseline.id} · {baseline.name}</option>)}
+        </select></label>
+        {baselines.loading && <p className="muted upload-hint" role="status">Loading saved baselines…</p>}
+        {baselines.error && <Notice error><p>{baselines.error}</p><button type="button" className="button secondary" disabled={baselines.loading} onClick={baselines.reload}>Retry baselines</button></Notice>}
+        <label>Save successful result as<input name="saveBaselineAs" maxLength={80} placeholder="Baseline name (optional)" aria-describedby="save-baseline-hint" disabled={busy === 'test'} /></label>
+        <p id="save-baseline-hint" className="muted upload-hint">A named baseline is available for future rehearsals in this project.</p>
+        <div className="actions">
+          <button type="button" className="button secondary" disabled={!!busy} onClick={() => action('validate')}><ShieldCheck size={16} /> {busy === 'validate' ? 'Validating…' : 'Validate SQL'}</button>
+          <button className="button primary" disabled={!!busy || baselines.loading}><Play size={16} /> {busy === 'test' ? 'Queuing…' : 'Run rehearsal'}</button>
+        </div>
+      </form>
     </> : migrations.loading ? <Notice>Loading SQL preview…</Notice> : <Empty>Select a migration to preview and rehearse its SQL.</Empty>}</section></div></>
+}
+
+function Baselines({ id }: { id: string }) {
+  const baselines = useResource<ProjectBaseline[]>('/projects/' + id + '/baselines')
+  const [confirm, setConfirm] = useState<number>()
+  const [deleting, setDeleting] = useState(false)
+  const [error, setError] = useState('')
+
+  async function remove(baselineId: number) {
+    setDeleting(true)
+    setError('')
+    try {
+      await api.delete('/projects/' + id + '/baselines/' + baselineId)
+      setConfirm(undefined)
+      baselines.reload()
+    } catch (e) { setError(errorMessage(e)) }
+    finally { setDeleting(false) }
+  }
+
+  return <section className="panel section">
+    <div className="section-heading"><div><p className="eyebrow">REHEARSAL STARTING POINTS</p><h2>Project baselines</h2></div><button className="button secondary" disabled={baselines.loading || deleting} onClick={baselines.reload}>Refresh</button></div>
+    <p className="muted">Start a rehearsal from the shared fixture or a saved baseline. Enter a name when starting a run to save its successful result.</p>
+    {(error || baselines.error) && <Notice error>{error || baselines.error}</Notice>}
+    {baselines.loading ? <Notice>Loading project baselines…</Notice> : baselines.data?.length ? <div className="table-wrap">
+      <table><thead><tr><th scope="col">Version</th><th scope="col">Name</th><th scope="col">Saved</th><th scope="col">Source</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
+        <tbody>{baselines.data.map(baseline => <tr key={baseline.id}>
+          <td><code>v{baseline.id}</code></td><td>{baseline.name}</td><td>{date(baseline.createdAt)}</td>
+          <td><Link className="text-link" to={'/reports/' + baseline.sourceRunId}>Run #{baseline.sourceRunId}</Link></td>
+          <td>{confirm === baseline.id ? <div className="actions">
+            <button className="button danger" disabled={deleting} onClick={() => remove(baseline.id)}>{deleting ? 'Deleting…' : 'Confirm deletion'}</button>
+            <button className="button secondary" disabled={deleting} onClick={() => setConfirm(undefined)}>Cancel</button>
+          </div> : <button className="icon-button" aria-label={'Delete baseline v' + baseline.id} disabled={deleting} onClick={() => setConfirm(baseline.id)}><Trash2 size={16} /></button>}</td>
+        </tr>)}</tbody>
+      </table>
+    </div> : !baselines.error && <Empty>Open Migrations to save your first project baseline.</Empty>}
+  </section>
 }
 
 function DatabasePanel({ id }: { id: string }) {

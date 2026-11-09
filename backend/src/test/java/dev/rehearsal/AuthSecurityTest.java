@@ -77,6 +77,17 @@ class AuthSecurityTest {
         assertTrue(budget.admit("third", 60));
     }
 
+    @Test
+    void bearerRouteExceptionsAreLimitedToTheSubmissionPostAndResultGet() throws Exception {
+        // This MVC slice has only the auth controller. A 404 means the request reached MVC.
+        mvc.perform(post("/api/ci/rehearsals")).andExpect(status().isNotFound());
+        mvc.perform(get("/api/ci/rehearsals/7")).andExpect(status().isNotFound());
+        mvc.perform(get("/api/ci/rehearsals")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/api/ci/rehearsals/7/files")).andExpect(status().isUnauthorized());
+        mvc.perform(post("/api/ci/rehearsals/7")).andExpect(status().isForbidden());
+        mvc.perform(post("/api/projects/42/ci-token")).andExpect(status().isForbidden());
+    }
+
     private Token csrf(MockHttpSession session) throws Exception {
         var response = mvc.perform(get("/api/auth/csrf").session(session))
             .andExpect(status().isOk())
