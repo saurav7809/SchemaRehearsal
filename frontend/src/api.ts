@@ -73,9 +73,17 @@ export type Project = { id: number; name: string; description: string; postgresV
 export type ProjectBaseline = { id: number; projectId: number; name: string; createdAt: string; sourceRunId: number }
 type MigrationFile = { name: string; sql: string }
 export type Migration = { id: number; projectId: number; name: string; sql: string | null; createdAt: string; files?: MigrationFile[] }
-export type Probe = { id: number; name: string; generation: 'OLD' | 'NEW'; sql: string }
+export const assertionLabels = {
+  ROW_COUNT_EQUALS: 'Row count equals',
+  SCALAR_EQUALS: 'Scalar equals',
+} as const
+export type QueryAssertion = { kind: keyof typeof assertionLabels; expected: number }
+export type Probe = { id: number; name: string; generation: 'OLD' | 'NEW'; sql: string; assertion?: QueryAssertion | null }
 export type Finding = { source: string; severity: string; title: string; filename?: string; table?: string; column?: string; statement?: string; evidence: string; recommendation: string }
-export type QueryResult = { success: boolean; columns: string[]; sampledRows: number; error?: string }
+export type QueryResult = {
+  success: boolean; columns: string[]; sampledRows: number; error?: string
+  assertion?: (QueryAssertion & { status: 'PASS' | 'FAIL'; reason: string }) | null
+}
 export type Run = {
   id: number; projectId: number; migrationId: number; migrationName: string; status: string; score: number; durationMs: number; createdAt: string
   report: {
@@ -84,6 +92,11 @@ export type Run = {
     baseline?: { id?: number | null; name: string; sourceRunId?: number | null }
     saveBaselineAs?: string
     savedBaseline?: ProjectBaseline
+    lockImpactTable?: string
+    lockImpact?: {
+      table: string; status: 'MEASURED' | 'UNAVAILABLE'; attempts: number; blockedAttempts: number
+      timedOutAttempts: number; maxWaitMs: number | null; note: string
+    }
     steps?: { name: string; status: string; durationMs: number }[]
     migrationFiles?: { name: string; status: 'APPLIED' | 'FAILED' | 'PENDING'; durationMs: number | null; error: string | null }[]
     changes?: { object: string; kind: string; before?: string; after?: string }[]

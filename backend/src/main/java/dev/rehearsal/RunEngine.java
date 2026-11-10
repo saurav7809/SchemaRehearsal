@@ -1,6 +1,7 @@
 package dev.rehearsal;
 
 import jakarta.annotation.PreDestroy;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.Size;
 import org.springframework.http.HttpStatus;
@@ -18,7 +19,10 @@ import java.util.function.Supplier;
 
 @Service
 class RunEngine {
-    record Request(@Positive Long baselineId,@Size(max=80) String saveBaselineAs) {}
+    record Request(@Positive Long baselineId,@Size(max=80) String saveBaselineAs,
+                   @Pattern(regexp="[a-z_][a-z0-9_]{0,62}") String lockImpactTable) {
+        Request(Long baselineId,String saveBaselineAs) { this(baselineId,saveBaselineAs,null); }
+    }
 
     private static final Logger log=LoggerFactory.getLogger(RunEngine.class);
     private static final long CLUSTER_LOCK=787713936294L;
@@ -30,11 +34,13 @@ class RunEngine {
     private final ExecutionPolicy policy;
     private final MetadataLease lease;
     private final BaselineStore baselines;
+    private final LockImpact lockImpact;
     private final Semaphore slots=new Semaphore(5);
     private final ExecutorService worker=Executors.newSingleThreadExecutor();
 
     RunEngine(WorkspaceStore store,DatabaseService databases,Analyzer analyzer,Sandbox sandbox,
-              ProjectService projects,ExecutionPolicy policy,MetadataLease lease,BaselineStore baselines) {
+              ProjectService projects,ExecutionPolicy policy,MetadataLease lease,BaselineStore baselines,
+              LockImpact lockImpact) {
         this.store=store;
         this.databases=databases;
         this.analyzer=analyzer;
@@ -43,6 +49,7 @@ class RunEngine {
         this.policy=policy;
         this.lease=lease;
         this.baselines=baselines;
+        this.lockImpact=lockImpact;
     }
 
     WorkspaceStore.Run submit(long id,String email,Request request) {
@@ -70,6 +77,7 @@ class RunEngine {
         try {
             var migration=source.get();
             Long baselineId=request==null ? null : request.baselineId();
+            String lockImpactTable=request==null ? null : request.lockImpactTable();
             var input=baselineId==null ? databases.load(migration.projectId()) : null;
             if (input!=null) databases.requireFixture(input);
             var save=snapshotRequest(request);
@@ -77,11 +85,11 @@ class RunEngine {
             if (!validation.valid()) throw WorkspaceStore.bad(validation.error());
             var probes=store.probes(migration.projectId(),email);
             long account=projects.account(email);
-            var queued=store.createRun(migration,email,baselineId,save,origin);
+            var queued=store.createRun(migration,email,baselineId,save,origin,lockImpactTable);
             var run=queued.run();
             try {
                 worker.execute(() -> {
-                    try { execute(queued,migration,input,probes,validation.findings(),account); }
+                    try { execute(queued,migration,input,probes,validation.findings(),account,lockImpactTable); }
                     catch (RuntimeException e) { recordFailure(run.id(),account,e); }
                     finally { slots.release(); }
                 });
@@ -105,7 +113,7 @@ class RunEngine {
     }
 
     private void execute(WorkspaceStore.QueuedRun queued,WorkspaceStore.Migration migration,DatabaseService.Input input,
-                         List<WorkspaceStore.Probe> probes,List<Risk.Finding> warnings,long account) {
+                         List<WorkspaceStore.Probe> probes,List<Risk.Finding> warnings,long account,String lockImpactTable) {
         long id=queued.run().id();
         var progress=new Progress(queued.run(),warnings);
         String database=sandbox.name();
@@ -136,10 +144,18 @@ class RunEngine {
                 }
                 progress.data.put("before",before);
                 progress.advance("Migration execution");
-                long migrationStart=System.nanoTime();
-                var execution=sandbox.migrate(database,migration);
-                long migrationMs=millis(migrationStart);
-                progress.data.put("migrationDurationMs",migrationMs);
+                Sandbox.MigrationExecution execution;
+                long migrationMs;
+                try (var observation=lockImpactTable==null ? null : lockImpact.start(database,lockImpactTable)) {
+                    long started=System.nanoTime();
+                    try {
+                        execution=sandbox.migrate(database,migration);
+                    } finally {
+                        migrationMs=millis(started);
+                        progress.data.put("migrationDurationMs",migrationMs);
+                        if (observation!=null) progress.data.put("lockImpact",observation.finish());
+                    }
+                }
                 progress.data.put("migrationsApplied",execution.applied());
                 progress.data.put("migrationFiles",execution.migrationFiles());
                 if (execution.error()!=null) throw new IllegalStateException(execution.error());
@@ -168,7 +184,8 @@ class RunEngine {
                     }
                     List<Compatibility.Comparison> comparisons=new ArrayList<>();
                     for (var probe:probes) {
-                        var comparison=Compatibility.compare(probe,baselineResults.get(probe.id()),Compatibility.run(c,probe.sql()));
+                        var comparison=Compatibility.compare(probe,baselineResults.get(probe.id()),
+                            Compatibility.run(c,probe.sql(),probe.assertion()));
                         comparisons.add(comparison);
                         addCompatibilityFinding(progress.findings,comparison);
                     }
@@ -191,6 +208,9 @@ class RunEngine {
             if (e instanceof RuntimeException && !(e instanceof FlywayException) && !(e instanceof IllegalStateException))
                 log.warn("Rehearsal {} failed in {} ({})",id,progress.stage,e.getClass().getSimpleName());
         }
+        if (lockImpactTable!=null && !progress.data.containsKey("lockImpact"))
+            progress.data.put("lockImpact",new LockImpact.Evidence(lockImpactTable,"UNAVAILABLE",0,0,0,0,
+                "The rehearsal ended before migration execution could be observed."));
         progress.advance("Risk analysis");
         var score=Risk.score(progress.findings);
         progress.data.put("risk",score);
@@ -257,6 +277,11 @@ class RunEngine {
     }
 
     private static void addCompatibilityFinding(List<Risk.Finding> findings,Compatibility.Comparison c) {
+        var assertion=c.migrated().assertion();
+        if (c.migrated().success() && assertion!=null && assertion.status().equals("FAIL"))
+            findings.add(Risk.observed("Query result assertion failed","HIGH",
+                c.name() + ": " + assertion.reason(),
+                "Verify the migration preserves the intended data and rerun the assertion."));
         switch (c.status()) {
             case "REGRESSION", "NEW_QUERY_FAILED" -> findings.add(Risk.observed("Compatibility query failed","HIGH",
                 c.name() + ": " + c.migrated().error(),"Update the migration or stage a compatibility layer, then rerun this query."));

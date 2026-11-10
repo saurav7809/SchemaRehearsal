@@ -20,6 +20,9 @@ function Assert($Condition, [string]$Message) {
 
 function Start-Rehearsal([long]$MigrationId, $Options) {
     $queued = Request POST "/migrations/$MigrationId/test" $Options
+    if ($Options.lockImpactTable) {
+        Assert ($queued.report.lockImpactTable -eq $Options.lockImpactTable) 'Queued report did not record the requested lock-impact table'
+    }
     $run = $queued
     $deadline = (Get-Date).AddSeconds(90)
     while ($run.status -in 'QUEUED','RUNNING' -and (Get-Date) -lt $deadline) {
@@ -111,6 +114,7 @@ $uploaded = Request POST "$project/migrations/upload" -Form @{ file=$sample }
 Assert ($uploaded.name -eq $sample.Name) 'Multipart upload failed'
 Assert ($uploaded.files.Count -eq 1 -and $uploaded.files[0].name -eq $sample.Name) 'Single-file upload is missing its file entry'
 $fixtures = @($fixtures | Where-Object name -ne '01_safe.sql') + @($uploaded)
+Assert-RequestRejected POST "/migrations/$($uploaded.id)/test" 400 @{ lockImpactTable='public.users' }
 
 foreach ($migration in ($fixtures | Sort-Object name)) {
     $validation = Request POST "/migrations/$($migration.id)/validate"
@@ -121,6 +125,7 @@ foreach ($migration in ($fixtures | Sort-Object name)) {
             Assert ($run.status -eq 'SUCCEEDED' -and $run.score -le 20) "Safe migration failed: $($run.report.error)"
             Assert ($run.report.changes.object -contains 'column public.users.notes') 'Schema difference missing'
             Assert ($run.report.compatibility.status -notcontains 'REGRESSION') 'Unexpected compatibility regression'
+            Assert ($null -eq $run.report.lockImpact -and $null -eq $run.report.lockImpactTable) 'Legacy rehearsal unexpectedly sampled locks'
         }
         '02_breaking.sql' {
             Assert ($run.status -eq 'SUCCEEDED' -and $run.score -gt 40) 'Breaking migration had unexpected status or risk'
@@ -149,10 +154,14 @@ $indexFile = Join-Path $indexFixture.FullName 'V2__new_foreign_key.sql'
 try {
     Set-Content -LiteralPath $indexFile -Value 'ALTER TABLE orders ADD COLUMN reviewer_id bigint REFERENCES users(id);' -Encoding utf8
     $indexMigration = Request POST "$project/migrations/upload" -Form @{ file=(Get-Item -LiteralPath $indexFile) }
-    $indexRun = Start-Rehearsal $indexMigration.id
+    $indexRun = Start-Rehearsal $indexMigration.id @{ lockImpactTable='missing_lock_probe_table' }
     Assert ($indexRun.status -eq 'SUCCEEDED') "Versioned Flyway migration failed: $($indexRun.report.error)"
     Assert ($indexRun.report.findings.title -contains 'New foreign key lacks a covering B-tree') 'Missing index evidence'
+    $unavailable = $indexRun.report.lockImpact
+    Assert ($unavailable.table -eq 'missing_lock_probe_table' -and $unavailable.status -eq 'UNAVAILABLE' -and
+        $unavailable.note) 'Missing lock-impact table was not reported as unavailable'
     Write-Output 'Versioned Flyway upload and catalog-backed index evidence passed.'
+    Write-Output 'Missing lock-impact table kept the rehearsal successful and reported unavailable evidence.'
 } finally {
     if (Test-Path -LiteralPath $indexFile) { Remove-Item -LiteralPath $indexFile }
     Remove-Item -LiteralPath $indexFixture.FullName
@@ -170,14 +179,20 @@ try {
     $validation = Request POST "/migrations/$($bundle.id)/validate"
     Assert $validation.valid "Ordered bundle validation failed: $($validation.error)"
     Assert ($validation.statementCount -eq 3 -and $validation.findings.filename -contains $second.Name) 'Bundle validation is missing its statement count or file-level finding'
-    $ordered = Start-Rehearsal $bundle.id
+    $ordered = Start-Rehearsal $bundle.id @{ lockImpactTable='users' }
     Assert ($ordered.status -eq 'SUCCEEDED') "Reverse-uploaded bundle failed: $($ordered.report.error)"
     Assert-RunFiles $ordered @($first.Name,$second.Name,$repeatable.Name) @('APPLIED','APPLIED','APPLIED')
     Assert ($ordered.report.changes.object -contains 'column public.users.bundle_summary') 'Ordered bundle schema change is missing'
     Assert ($ordered.report.changes.object -notcontains 'column public.users.bundle_notes') 'Schema diff contains an intermediate column'
     Assert ($ordered.report.changes.object -contains 'table public.bundle_view') 'Repeatable migration view is missing'
+    $lock = $ordered.report.lockImpact
+    Assert ($lock.table -eq 'users' -and $lock.status -eq 'MEASURED' -and $lock.attempts -ge 1 -and $lock.note) 'Lock impact was not measured on users'
+    Assert ($lock.blockedAttempts -ge 0 -and $lock.blockedAttempts -le $lock.attempts -and
+        $lock.timedOutAttempts -ge 0 -and $lock.timedOutAttempts -le $lock.blockedAttempts -and
+        $lock.maxWaitMs -ge 0) 'Lock-impact measurement returned inconsistent counters'
     Assert-Pdf $ordered.id
     Write-Output 'Reverse-uploaded bundle passed in Flyway version order.'
+    Write-Output 'Lock impact measured on the existing users table.'
 
     $collisionA = New-SqlFile $bundleFixture.FullName 'V1__add_collision_text.sql' 'ALTER TABLE users ADD COLUMN bundle_collision text;'
     $collisionB = New-SqlFile $bundleFixture.FullName 'V2__add_collision_integer.sql' 'ALTER TABLE users ADD COLUMN bundle_collision integer;'
@@ -294,6 +309,61 @@ try {
 } finally {
     Get-ChildItem -LiteralPath $baselineFixture.FullName -File | ForEach-Object { Remove-Item -LiteralPath $_.FullName }
     Remove-Item -LiteralPath $baselineFixture.FullName
+}
+
+foreach ($invalidAssertion in @(
+    @{ kind='ROW_COUNT_EQUALS'; expected=101 }
+    @{ kind='SCALAR_EQUALS'; expected=1.5 }
+    @{ kind='SCALAR_EQUALS'; expected=[long]9007199254740992 }
+)) {
+    Assert-RequestRejected POST "$project/queries" 400 @{
+        name='Invalid assertion'; generation='NEW'; sql='SELECT 1'; assertion=$invalidAssertion
+    }
+}
+$scalarProbe = Request POST "$project/queries" @{
+    name='Order total'; generation='OLD'; sql='SELECT total_cents FROM orders WHERE id=1'
+    assertion=@{ kind='SCALAR_EQUALS'; expected=2499 }
+}
+$countProbe = Request POST "$project/queries" @{
+    name='Orders below threshold'; generation='NEW'; sql='SELECT id FROM orders WHERE total_cents < 3000'
+    assertion=@{ kind='ROW_COUNT_EQUALS'; expected=2 }
+}
+$savedQueries = Request GET "$project/queries"
+$savedScalar = $savedQueries | Where-Object id -eq $scalarProbe.id
+$savedCount = $savedQueries | Where-Object id -eq $countProbe.id
+Assert ($savedScalar.assertion.kind -eq 'SCALAR_EQUALS' -and $savedScalar.assertion.expected -eq 2499) 'Scalar assertion was not saved'
+Assert ($savedCount.assertion.kind -eq 'ROW_COUNT_EQUALS' -and $savedCount.assertion.expected -eq 2) 'Row-count assertion was not saved'
+
+$assertionFixture = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) ('rehearsal-assertions-' + [guid]::NewGuid().ToString('N')))
+try {
+    $wrongSql = 'UPDATE orders SET total_cents=9912345 WHERE id=1;'
+    $cases = @(
+        @{ name='V51__wrong_order_total.sql'; sql=$wrongSql; status='FAIL' }
+        @{ name='V51__repair_order_total.sql'; sql="$wrongSql UPDATE orders SET total_cents=2499 WHERE id=1;"; status='PASS' }
+    )
+    foreach ($case in $cases) {
+        $file = New-SqlFile $assertionFixture.FullName $case.name $case.sql
+        $migration = Request POST "$project/migrations/upload" -Form @{ file=$file }
+        $run = Start-Rehearsal $migration.id
+        Assert ($run.status -eq 'SUCCEEDED') "Assertion fixture migration failed: $($run.report.error)"
+        foreach ($query in @($scalarProbe,$countProbe)) {
+            $comparison = $run.report.compatibility | Where-Object id -eq $query.id
+            $assertion = $comparison.migrated.assertion
+            Assert ($comparison.status -eq 'PASS') "Result shape changed for $($query.name)"
+            Assert ($null -eq $comparison.baseline.assertion) "An assertion ran on the baseline for $($query.name)"
+            Assert ($assertion.kind -eq $query.assertion.kind -and $assertion.expected -eq $query.assertion.expected -and
+                $assertion.status -eq $case.status -and $assertion.reason) "Unexpected assertion outcome for $($query.name)"
+            Assert ((($assertion.PSObject.Properties.Name | Sort-Object) -join ',') -eq 'expected,kind,reason,status' -and
+                $assertion.reason -notmatch '9912345') 'Assertion evidence exposed a result value'
+        }
+        $legacy = $run.report.compatibility | Where-Object id -eq $probe.id
+        Assert ($legacy.status -eq 'PASS' -and $null -eq $legacy.migrated.assertion) 'Legacy probe changed behavior'
+        Assert-Pdf $run.id
+    }
+    Write-Output 'Same-shape wrong results failed scalar and row-count assertions. Both passed after repair, and the legacy probe still passed.'
+} finally {
+    Get-ChildItem -LiteralPath $assertionFixture.FullName -File | ForEach-Object { Remove-Item -LiteralPath $_.FullName }
+    Remove-Item -LiteralPath $assertionFixture.FullName
 }
 
 Request POST '/auth/logout'

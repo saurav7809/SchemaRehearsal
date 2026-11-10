@@ -80,6 +80,24 @@ def test_missing_report_origin_never_publishes_an_internal_link(monkeypatch):
     assert "target_url" not in github.statuses[-1]
 
 
+def test_failed_assertion_fails_the_status_and_appears_in_summary(monkeypatch, tmp_path):
+    class FailedAssertion(Rehearsal):
+        def request(self, path, **kwargs):
+            result = super().request(path, **kwargs)
+            if result["verdict"] == "FAIL":
+                result.update(compatibilityRegressions=0, assertionFailures=1)
+            return result
+
+    monkeypatch.setattr(ci.time, "sleep", lambda _seconds: None)
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    github = GitHub([{"filename": "db/V1__nickname.sql", "status": "added", "sha": OID}])
+    assert ci.check(github, FailedAssertion("FAIL", "SUCCEEDED"), PR, "db/", None) == 1
+    assert github.statuses[-1]["state"] == "failure"
+    assert github.statuses[-1]["description"] == "Query result assertion failed."
+    assert "Failed query assertions: 1" in summary.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("change", [
     {"filename": "db/V1__nickname.sql", "status": "removed"},
     {"filename": "archive/V1__nickname.sql", "previous_filename": "db/V1__nickname.sql", "status": "renamed"},

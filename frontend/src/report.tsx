@@ -1,7 +1,7 @@
 import { useEffect, useState, type MouseEvent } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { ArrowLeft, Check, Circle, Clock3, Download, FileCheck2, LoaderCircle, X } from 'lucide-react'
-import { api, date, errorMessage, pending, useResource, type QueryResult, type Run } from './api'
+import { api, assertionLabels, date, errorMessage, pending, useResource, type QueryResult, type Run } from './api'
 import { Badge, Empty, Heading, Notice } from './ui'
 
 const saveBaselineStage = 'Save baseline snapshot'
@@ -58,6 +58,8 @@ function ReportDetail({ id }: { id: string }) {
   </>
   const report = run.report
   const scoring = report.risk
+  const lockImpact = report.lockImpact
+  const lockImpactTable = lockImpact?.table ?? report.lockImpactTable
   const runStages = report.saveBaselineAs ? stages : stages.filter(name => name !== saveBaselineStage)
   return <><Link className="text-link back" to="/reports"><ArrowLeft size={15} /> Reports</Link>
     <Heading eyebrow={'REHEARSAL #' + run.id} title={run.migrationName} description={date(run.createdAt) + ' · ' + run.durationMs + ' ms elapsed'} action={active ? <Badge value={run.status} /> : <a className="button primary" href={'/api/reports/' + run.id + '/download'} aria-disabled={downloading} onClick={event => void downloadReport(event, run.id)}><Download size={17} /> {downloading ? 'Downloading…' : 'Download PDF'}</a>} />
@@ -89,6 +91,24 @@ function ReportDetail({ id }: { id: string }) {
         </dd></div>}
         {report.saveBaselineAs && !report.savedBaseline && <div><dt>Requested baseline</dt><dd>{report.saveBaselineAs}</dd></div>}
       </dl>
+    </section>}
+    {lockImpactTable && <section className="panel section" aria-labelledby="report-lock-impact-title">
+      <div className="section-heading"><div><p className="eyebrow">TABLE-LEVEL LOCK PROBE</p><h2 id="report-lock-impact-title">Lock impact</h2></div>
+        <Badge value={lockImpact?.status ?? (active ? 'PENDING' : 'NOT_RECORDED')} />
+      </div>
+      <dl className="baseline-summary">
+        <div><dt>Table</dt><dd><code>public.{lockImpactTable}</code></dd></div>
+        {lockImpact && (lockImpact.status === 'MEASURED' || lockImpact.attempts > 0) && <>
+          <div><dt>Attempts</dt><dd>{lockImpact.attempts}</dd></div>
+          <div><dt>Blocked attempts</dt><dd>{lockImpact.blockedAttempts}</dd></div>
+          <div><dt>Timed-out attempts</dt><dd>{lockImpact.timedOutAttempts}</dd></div>
+          <div><dt>Longest observed retry wait</dt><dd>{lockImpact.maxWaitMs == null ? '—' : lockImpact.maxWaitMs + ' ms'}</dd></div>
+        </>}
+      </dl>
+      <p className="muted lock-impact-note">{lockImpact?.note ?? (active
+        ? 'The lock-only probe will run during migration execution.'
+        : 'The rehearsal ended before lock-impact evidence was recorded.')}</p>
+      <p className="muted upload-hint">This probe estimates PostgreSQL table-level write-lock waits in the rehearsal database. Timed-out attempts establish a lower bound.</p>
     </section>}
     <div className="split report-grid"><section className="panel section">
       <div className="section-heading"><div><p className="eyebrow">EXECUTION TIMELINE</p><h2>Testing workflow</h2></div><Badge value={run.status} /></div>
@@ -128,7 +148,9 @@ function ReportDetail({ id }: { id: string }) {
     </section>
     <section className="panel section"><div className="section-heading"><div><p className="eyebrow">APPLICATION QUERIES</p><h2>Compatibility evidence</h2></div></div>
       {report.compatibility?.length ? report.compatibility.map(probe => <article className="probe" key={probe.id}>
-        <div className="section-heading"><h3>{probe.name} <Badge value={probe.generation} /></h3><Badge value={probe.status} /></div>
+        <div className="section-heading"><h3>{probe.name} <Badge value={probe.generation} /></h3>
+          <span className="actions"><span className="muted upload-hint">Query compatibility</span><Badge value={probe.status} /></span>
+        </div>
         <div className="probe-results"><QueryEvidence title="Baseline" result={probe.baseline} /><QueryEvidence title="Migrated" result={probe.migrated} /></div>
       </article>) : <Empty>No compatibility comparisons were recorded.</Empty>}
     </section>
@@ -141,7 +163,15 @@ function ReportDetail({ id }: { id: string }) {
 }
 
 function QueryEvidence({ title, result }: { title: string; result?: QueryResult }) {
-  return <div><p className="eyebrow">{title}</p>{!result ? <p className="muted">Skipped</p> : result.success
-    ? <><p className="muted">{result.sampledRows} sampled rows</p><code>{result.columns.join(', ')}</code></>
-    : <pre className="error-evidence">{result.error}</pre>}</div>
+  const assertion = result?.assertion
+  return <div><p className="eyebrow">{title}</p>
+    {!result ? <p className="muted">Skipped</p> : result.success
+      ? <><p className="muted">{result.sampledRows} sampled rows</p><code>{result.columns.join(', ')}</code></>
+      : <pre className="error-evidence">{result.error}</pre>}
+    {assertion && <div className="query-assertion">
+      <p><strong>Result assertion</strong> <Badge value={assertion.status} /></p>
+      <p>{assertionLabels[assertion.kind]} <code>{assertion.expected}</code></p>
+      <p className="muted">{assertion.reason}</p>
+    </div>}
+  </div>
 }

@@ -1,7 +1,14 @@
 package dev.rehearsal;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+import com.fasterxml.jackson.databind.DeserializationContext;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.*;
 import org.flywaydb.core.api.MigrationVersion;
 import org.springframework.http.HttpStatus;
@@ -22,10 +29,28 @@ import java.util.*;
 class WorkspaceStore {
     record MigrationFile(String name,String sql) {}
     record Migration(long id,long projectId,String name,String sql,Instant createdAt,List<MigrationFile> files) {}
+    record AssertionInput(@NotNull @Pattern(regexp="ROW_COUNT_EQUALS|SCALAR_EQUALS") String kind,
+                          @NotNull @Min(-9007199254740991L) @Max(9007199254740991L)
+                          @JsonDeserialize(using=ExactInteger.class) Long expected) {}
     record ProbeInput(@NotBlank @Size(max=120) String name,
                       @NotNull @Pattern(regexp="OLD|NEW") String generation,
-                      @NotBlank @Size(max=8000) String sql) {}
-    record Probe(long id,String name,String generation,String sql) {}
+                      @NotBlank @Size(max=8000) String sql,@Valid AssertionInput assertion) {
+        ProbeInput(String name,String generation,String sql) { this(name,generation,sql,null); }
+    }
+    record Probe(long id,String name,String generation,String sql,
+                 @JsonInclude(JsonInclude.Include.NON_NULL) AssertionInput assertion) {
+        Probe(long id,String name,String generation,String sql) { this(id,name,generation,sql,null); }
+    }
+
+    static final class ExactInteger extends StdDeserializer<Long> {
+        ExactInteger() { super(Long.class); }
+
+        @Override public Long deserialize(JsonParser parser,DeserializationContext context) throws IOException {
+            if (!parser.hasToken(JsonToken.VALUE_NUMBER_INT))
+                return (Long) context.handleUnexpectedToken(Long.class,parser);
+            return parser.getLongValue();
+        }
+    }
     record Run(long id,long projectId,long migrationId,String migrationName,String status,int score,
                Instant createdAt,long durationMs,Map<String,Object> report) {}
     record QueuedRun(Run run,BaselineStore.Stored baseline,BaselineStore.Stored snapshot) {}
@@ -144,12 +169,18 @@ class WorkspaceStore {
     @Transactional
     Probe addProbe(long id,String email,ProbeInput input) {
         var project=projects.require(id,email);
+        var assertion=input.assertion();
+        if (assertion!=null && assertion.kind().equals("ROW_COUNT_EQUALS")
+                && (assertion.expected()<0 || assertion.expected()>100))
+            throw bad("An exact row count must be between 0 and 100.");
         jdbc.queryForObject("select id from projects where id=? for update",Long.class,id);
         if (jdbc.queryForObject("select count(*) from probes where project_id=?",Integer.class,id)>=12)
             throw bad("A project supports up to 12 compatibility probes");
         var probe=jdbc.queryForObject("""
-            insert into probes(project_id,name,generation,sql_text) values (?,?,?,?) returning *
-            """,this::probeRow,id,input.name(),input.generation(),input.sql());
+            insert into probes(project_id,name,generation,sql_text,assertion_kind,assertion_expected)
+            values (?,?,?,?,?,?) returning *
+            """,this::probeRow,id,input.name(),input.generation(),input.sql(),
+            assertion==null ? null : assertion.kind(),assertion==null ? null : assertion.expected());
         projects.audit(project.ownerId,"PROBE_ADDED",probe.id());
         return probe;
     }
@@ -166,11 +197,14 @@ class WorkspaceStore {
     }
 
     private Probe probeRow(ResultSet r,int row) throws SQLException {
-        return new Probe(r.getLong("id"),r.getString("name"),r.getString("generation"),r.getString("sql_text"));
+        String kind=r.getString("assertion_kind");
+        var assertion=kind==null ? null : new AssertionInput(kind,r.getLong("assertion_expected"));
+        return new Probe(r.getLong("id"),r.getString("name"),r.getString("generation"),r.getString("sql_text"),assertion);
     }
 
     @Transactional
-    QueuedRun createRun(Migration migration,String email,Long baselineId,BaselineStore.NewSnapshot save,CiOrigin origin) {
+    QueuedRun createRun(Migration migration,String email,Long baselineId,BaselineStore.NewSnapshot save,CiOrigin origin,
+                        String lockImpactTable) {
         long account=projects.account(email);
         // Serialize the account quota check without blocking audit foreign-key checks.
         jdbc.queryForObject("select id from accounts where id=? for no key update",Long.class,account);
@@ -188,6 +222,7 @@ class WorkspaceStore {
         report.put("baseline",baseline==null ? Map.of("name","Shared fixture") : baseline.view());
         if (save!=null) report.put("saveBaselineAs",save.name());
         if (origin!=null) report.put("ci",origin);
+        if (lockImpactTable!=null) report.put("lockImpactTable",lockImpactTable);
         var run=jdbc.queryForObject("""
             insert into test_runs(project_id,migration_id,migration_name,status,score,duration_ms,report,ci_submission)
             values (?,?,?,'QUEUED',0,0,?::jsonb,?) returning *

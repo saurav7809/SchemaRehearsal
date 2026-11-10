@@ -41,6 +41,21 @@ class CiVerdictTests {
         assertEquals("PENDING",CiVerdict.of(run("QUEUED"),json.createObjectNode()).verdict());
     }
 
+    @Test void blocksAnAssertionFailureWithoutAMigrationOrShapeFailure() throws Exception {
+        var report=json.readTree("""
+            {"compatibility":[
+                {"status":"PASS","migrated":{"assertion":{"status":"FAIL","reason":"Expected result not met"}}},
+                {"status":"PASS","migrated":{"assertion":{"status":"PASS"}}}
+            ]}
+            """);
+        var verdict=CiVerdict.of(run("SUCCEEDED"),report);
+        assertEquals("FAIL",verdict.verdict());
+        assertEquals("Query result assertion failed",verdict.reason());
+        assertEquals(1,verdict.assertionFailures());
+        assertEquals(0,verdict.compatibilityRegressions());
+        assertFalse(json.writeValueAsString(verdict).contains("Expected result not met"));
+    }
+
     private WorkspaceStore.Run run(String status) {
         return new WorkspaceStore.Run(42,1,2,"CI rehearsal",status,0,Instant.EPOCH,0,Map.of());
     }

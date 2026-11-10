@@ -42,6 +42,23 @@ class ReportPdf {
             }
             lines.add("");
         }
+        if (report.has("lockImpactTable")) {
+            var observation=report.path("lockImpact");
+            lines.add("LOCK IMPACT");
+            lines.add("Target table: public." + report.path("lockImpactTable").asText());
+            if (observation.isObject()) {
+                lines.add("Status: " + observation.path("status").asText());
+                if (observation.path("status").asText().equals("MEASURED"))
+                    lines.add("Samples: " + observation.path("attempts").asText()
+                        + " | Blocked: " + observation.path("blockedAttempts").asText()
+                        + " | Timed out: " + observation.path("timedOutAttempts").asText()
+                        + " | Longest observed wait: " + observation.path("maxWaitMs").asText() + " ms");
+                lines.add(observation.path("note").asText());
+            } else {
+                lines.add("No lock measurement was captured.");
+            }
+            lines.add("");
+        }
         lines.add("FINDINGS AND RECOMMENDATIONS");
         if (report.path("findings").isEmpty()) lines.add("No findings were recorded.");
         for (var f:report.path("findings")) {
@@ -67,6 +84,10 @@ class ReportPdf {
                     lines.add(side + ": " + (result.path("success").asBoolean()
                         ? result.path("columns") + " (" + result.path("sampledRows").asText() + " sampled rows)"
                         : result.path("error").asText()));
+                var assertion=result.path("assertion");
+                if (assertion.isObject())
+                    lines.add("Assertion: " + assertion.path("kind").asText() + " " + assertion.path("expected").asText()
+                        + " | " + assertion.path("status").asText() + " | " + assertion.path("reason").asText());
             }
         }
         lines.add("");

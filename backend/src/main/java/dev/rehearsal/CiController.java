@@ -51,7 +51,7 @@ final class CiVerdict {
     private CiVerdict() {}
 
     record View(long runId,String status,String verdict,String reason,String failedFile,
-                String sqlState,int compatibilityRegressions,String reportPath) {}
+                String sqlState,int compatibilityRegressions,int assertionFailures,String reportPath) {}
 
     static View of(WorkspaceStore.Run run,JsonNode report) {
         String verdict;
@@ -59,6 +59,7 @@ final class CiVerdict {
         String failedFile=null;
         String evidence=report.path("error").asText();
         int regressions=0;
+        int assertionFailures=0;
         if (run.status().equals("FAILED")) {
             for (var file:report.path("migrationFiles")) {
                 if (!file.path("status").asText().equals("FAILED")) continue;
@@ -71,19 +72,22 @@ final class CiVerdict {
         } else if (run.status().equals("SUCCEEDED")) {
             for (var probe:report.path("compatibility")) {
                 String status=probe.path("status").asText();
+                if (probe.path("migrated").path("assertion").path("status").asText().equals("FAIL"))
+                    assertionFailures++;
                 if (status.equals("REGRESSION") || status.equals("SHAPE_CHANGED")) {
                     regressions++;
                     if (evidence.isEmpty()) evidence=probe.path("migrated").path("error").asText();
                 }
             }
-            verdict=regressions==0 ? "PASS" : "FAIL";
-            reason=regressions==0 ? "Migration rehearsal passed" : "Existing query compatibility regressed";
+            verdict=regressions==0 && assertionFailures==0 ? "PASS" : "FAIL";
+            reason=assertionFailures>0 ? "Query result assertion failed"
+                : regressions>0 ? "Existing query compatibility regressed" : "Migration rehearsal passed";
         } else {
             verdict="PENDING";
             reason="Rehearsal is in progress";
         }
         var match=SQLSTATE.matcher(evidence);
         return new View(run.id(),run.status(),verdict,reason,failedFile,match.find() ? match.group(1) : null,
-            regressions,"/reports/" + run.id());
+            regressions,assertionFailures,"/reports/" + run.id());
     }
 }

@@ -9,7 +9,7 @@ export function Brand() {
 
 export function Badge({ value }: { value: string }) {
   const tone = ['SUCCEEDED', 'APPLIED', 'LOW', 'PASS', 'ADDED'].includes(value) ? 'good'
-    : ['FAILED', 'HIGH', 'CRITICAL', 'REGRESSION', 'NEW_QUERY_FAILED', 'REMOVED'].includes(value) ? 'bad'
+    : ['FAILED', 'FAIL', 'HIGH', 'CRITICAL', 'REGRESSION', 'NEW_QUERY_FAILED', 'REMOVED'].includes(value) ? 'bad'
     : ['MEDIUM', 'RUNNING', 'SHAPE_CHANGED', 'MODIFIED'].includes(value) ? 'warn' : 'neutral'
   return <span className={'badge ' + tone}>{value.replaceAll('_', ' ')}</span>
 }

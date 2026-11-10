@@ -70,6 +70,14 @@ To rehearse changes together, select multiple Flyway SQL files in a single uploa
 
 Choose the shared fixture or a saved project baseline when starting a rehearsal. To capture the resulting schema and data as a new version, enter a baseline label before starting the run. A successful run saves an immutable baseline that the same project can select for future rehearsals. Each run uses a fresh clone of the selected version, and its report records the baseline and originating run. Projects can retain up to five versions. Deleting one removes it from future selections while existing reports retain its identity.
 
+## Check query results
+
+In **Compatibility**, add an optional assertion to an OLD or NEW query. Use an exact row count for a short result set or an integer scalar for a query such as `SELECT COUNT(*) FROM orders`. The report shows whether the migrated result met the expectation separately from whether the query still ran with the expected result shape. [Assertion API and limits](docs/api.md#query-result-assertions)
+
+## Sample write-lock impact
+
+For a manual rehearsal, optionally enter the name of an existing table in the `public` schema, such as `users`. While Flyway runs, SchemaRehearsal samples whether a concurrent request for the table lock normally taken by writes has to wait. The report shows the attempts, blocks, timeouts, and longest observed wait on the disposable clone. [Lock-impact API and interpretation](docs/api.md#lock-impact-sampling)
+
 ## Rehearse pull requests with GitHub Actions
 
 The [opt-in CI guide](docs/github-ci.md) shows how to bind a project token to a saved baseline and rehearse reviewed SQL changes from a same-repository pull request. The workflow publishes a commit status and report summary against the pull request head.
@@ -85,7 +93,7 @@ npm.cmd --prefix frontend run build
 .\scripts\smoke.ps1
 ```
 
-The smoke script needs a running backend and a disposable development cluster. It registers test accounts and leaves results available for inspection. It checks the original demo, Flyway bundle ordering and upload limits, and contrasting outcomes for the same migration against two saved project baselines. Use `-BaseUrl http://127.0.0.1:5173` to test through the Vite proxy.
+The smoke script needs a running backend and a disposable development cluster. It registers test accounts and leaves results available for inspection. It checks the original demo, Flyway bundles, version-specific outcomes, lock-impact reporting, and query assertions that catch wrong results even when the result shape stays the same. Use `-BaseUrl http://127.0.0.1:5173` to test through the Vite proxy.
 
 - [Windows and PostgreSQL setup](docs/windows.md)
 - [Production deployment and operations](docs/production.md)

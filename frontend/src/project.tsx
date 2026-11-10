@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, Braces, Database, FlaskConical, Play, Plus, ShieldCheck, Trash2, Upload } from 'lucide-react'
-import { api, date, errorMessage, useResource, type Finding, type Migration, type Probe, type Project, type ProjectBaseline, type Run } from './api'
+import { api, assertionLabels, date, errorMessage, useResource, type Finding, type Migration, type Probe, type Project, type ProjectBaseline, type QueryAssertion, type Run } from './api'
 import { ProjectCi } from './ci'
 import { Badge, Empty, Heading, Notice, RunsTable } from './ui'
 
@@ -76,7 +76,8 @@ function Migrations({ id }: { id: string }) {
         const values = new FormData(form)
         const baselineId = Number(values.get('baselineId')) || undefined
         const saveBaselineAs = String(values.get('saveBaselineAs') ?? '').trim() || undefined
-        const options = baselineId || saveBaselineAs ? { baselineId, saveBaselineAs } : undefined
+        const lockImpactTable = String(values.get('lockImpactTable') ?? '') || undefined
+        const options = baselineId || saveBaselineAs || lockImpactTable ? { baselineId, saveBaselineAs, lockImpactTable } : undefined
         const { data } = await api.post<Run>('/migrations/' + migration.id + '/test', options)
         navigate('/reports/' + data.id)
       }
@@ -116,6 +117,10 @@ function Migrations({ id }: { id: string }) {
         {baselines.error && <Notice error><p>{baselines.error}</p><button type="button" className="button secondary" disabled={baselines.loading} onClick={baselines.reload}>Retry baselines</button></Notice>}
         <label>Save successful result as<input name="saveBaselineAs" maxLength={80} placeholder="Baseline name (optional)" aria-describedby="save-baseline-hint" disabled={busy === 'test'} /></label>
         <p id="save-baseline-hint" className="muted upload-hint">A named baseline is available for future rehearsals in this project.</p>
+        <label>Lock-impact table<input name="lockImpactTable" pattern="[a-z_][a-z0-9_]{0,62}" placeholder="users (optional)"
+          title="Use up to 63 lowercase letters, digits, or underscores, starting with a letter or underscore."
+          aria-describedby="lock-impact-hint" autoCapitalize="none" spellCheck={false} disabled={busy === 'test'} /></label>
+        <p id="lock-impact-hint" className="muted upload-hint">Enter a plain table name from the <code>public</code> schema, such as <code>users</code>. The lock-only probe estimates table-level write blocking during the rehearsal.</p>
         <div className="actions">
           <button type="button" className="button secondary" disabled={!!busy} onClick={() => action('validate')}><ShieldCheck size={16} /> {busy === 'validate' ? 'Validating…' : 'Validate SQL'}</button>
           <button className="button primary" disabled={!!busy || baselines.loading}><Play size={16} /> {busy === 'test' ? 'Queuing…' : 'Run rehearsal'}</button>
@@ -210,12 +215,29 @@ function Queries({ id }: { id: string }) {
   const queries = useResource<Probe[]>('/projects/' + id + '/queries')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [assertionKind, setAssertionKind] = useState<QueryAssertion['kind'] | ''>('')
+  const rowCount = assertionKind === 'ROW_COUNT_EQUALS'
+
   async function add(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
-    setBusy(true)
+    const { assertionExpected, ...query } = Object.fromEntries(new FormData(form))
+    const entered = String(assertionExpected ?? '').trim()
+    const expected = Number(entered)
+    if (assertionKind && (!/^-?\d+$/.test(entered) || !Number.isSafeInteger(expected)
+        || (rowCount && (expected < 0 || expected > 100)))) {
+      setError(rowCount ? 'Enter a whole row count from 0 to 100.' : 'Enter a whole scalar value from -9007199254740991 to 9007199254740991.')
+      return
+    }
     setError('')
-    try { await api.post('/projects/' + id + '/queries', Object.fromEntries(new FormData(form))); form.reset(); queries.reload() }
+    setBusy(true)
+    try {
+      const payload = assertionKind ? { ...query, assertion: { kind: assertionKind, expected } } : query
+      await api.post('/projects/' + id + '/queries', payload)
+      form.reset()
+      setAssertionKind('')
+      queries.reload()
+    }
     catch (e) { setError(errorMessage(e)) }
     finally { setBusy(false) }
   }
@@ -232,11 +254,25 @@ function Queries({ id }: { id: string }) {
       <form className="form-stack" onSubmit={add}><label>Query name<input name="name" required maxLength={120} placeholder="Customer directory" /></label>
         <label>Application version<select name="generation"><option value="OLD">Old application</option><option value="NEW">New application</option></select></label>
         <label>Read-only SQL<textarea name="sql" required maxLength={8000} className="mono" placeholder="SELECT id, email FROM users;" rows={5} /></label>
+        <label>Result assertion<select value={assertionKind} onChange={event => setAssertionKind(event.target.value as QueryAssertion['kind'] | '')}>
+          <option value="">No assertion</option>
+          {Object.entries(assertionLabels).map(([kind, label]) => <option key={kind} value={kind}>{label}</option>)}
+        </select></label>
+        {assertionKind && <>
+          <label>Expected integer<input key={assertionKind} name="assertionExpected" type="text"
+            inputMode={rowCount ? 'numeric' : undefined} required autoComplete="off" aria-describedby="query-assertion-hint" /></label>
+          <p className="muted upload-hint" id="query-assertion-hint">{rowCount
+            ? 'The migrated query must return this many rows. Enter an integer from 0 to 100.'
+            : 'The migrated query must return one row and one column with this integer. The range is -9007199254740991 to 9007199254740991.'}</p>
+        </>}
         <div><button className="button primary" disabled={busy}><Plus size={16} /> Add query</button></div>
       </form></section>
     <section className="panel section"><div className="section-heading"><div><p className="eyebrow">SAVED PROBES</p><h2>Compatibility queries</h2></div></div>
       {queries.loading ? <Notice>Loading queries…</Notice> : !queries.data?.length ? <Empty>Register a query your application relies on.</Empty> : queries.data.map(query => <article className="probe" key={query.id}>
-        <div className="section-heading"><h3>{query.name} <Badge value={query.generation} /></h3><button className="icon-button" disabled={busy} aria-label={'Remove ' + query.name} onClick={() => remove(query)}><Trash2 size={16} /></button></div><pre className="code">{query.sql}</pre></article>)}
+        <div className="section-heading"><h3>{query.name} <Badge value={query.generation} /></h3><button className="icon-button" disabled={busy} aria-label={'Remove ' + query.name} onClick={() => remove(query)}><Trash2 size={16} /></button></div>
+        {query.assertion && <p className="muted upload-hint">Migrated result · {assertionLabels[query.assertion.kind]} <code>{query.assertion.expected}</code></p>}
+        <pre className="code">{query.sql}</pre>
+      </article>)}
     </section></div></>
 }
 

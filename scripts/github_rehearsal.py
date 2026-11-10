@@ -230,6 +230,9 @@ def summary(message, report_url=None, run=None):
         count = run.get("compatibilityRegressions")
         if type(count) is int and count > 0:
             lines.append(f"- Existing query regressions: {count}")
+        count = run.get("assertionFailures")
+        if type(count) is int and count > 0:
+            lines.append(f"- Failed query assertions: {count}")
     if report_url:
         lines.append(f"- [Open the authenticated report]({report_url})")
     target = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -259,6 +262,7 @@ def check(github, ci, pr, directory, report_origin):
         report_url = f"{report_origin}/reports/{run['runId']}" if report_origin else None
         passed = run["verdict"] == "PASS"
         message = ("Migration rehearsal passed." if passed else
+                   "Query result assertion failed." if run.get("assertionFailures", 0) > 0 else
                    "Existing query compatibility regressed." if run["status"] == "SUCCEEDED" else
                    "Migration rehearsal failed.")
         pr.status(github, "success" if passed else "failure", message, report_url)
